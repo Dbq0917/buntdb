@@ -2958,3 +2958,290 @@ func TestIssue112(t *testing.T) {
 		return err
 	})
 }
+
+func TestIteratorBasic(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+	if err := db.Update(func(tx *Tx) error {
+		for i := 0; i < 100; i++ {
+			_, _, err := tx.Set(fmt.Sprintf("key:%05d", i),
+				fmt.Sprintf("%d", i+1000), nil)
+			if err != nil {
+				return err
+			}
+		}
+		return tx.CreateIndex("num", "*", IndexInt)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	collect := func(it *Iterator) ([]string, []string, error) {
+		var keys, vals []string
+		for it.Next() {
+			keys = append(keys, it.Key())
+			vals = append(vals, it.Value())
+		}
+		return keys, vals, it.Err()
+	}
+	// ascending over all keys
+	keys, vals, err := collect(db.AscendIterator("", "", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 100 {
+		t.Fatalf("expected %v, got %v", 100, len(keys))
+	}
+	for i := 0; i < 100; i++ {
+		if keys[i] != fmt.Sprintf("key:%05d", i) {
+			t.Fatalf("expected %v, got %v",
+				fmt.Sprintf("key:%05d", i), keys[i])
+		}
+		if vals[i] != fmt.Sprintf("%d", i+1000) {
+			t.Fatalf("expected %v, got %v", i+1000, vals[i])
+		}
+	}
+	// ascending range [key:00010, key:00020)
+	keys, _, err = collect(db.AscendIterator("", "key:00010", "key:00020"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 10 || keys[0] != "key:00010" || keys[9] != "key:00019" {
+		t.Fatalf("bad range: %v", keys)
+	}
+	// descending over all keys
+	keys, _, err = collect(db.DescendIterator("", "", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 100 || keys[0] != "key:00099" || keys[99] != "key:00000" {
+		t.Fatalf("bad descend")
+	}
+	// descending range [key:00020, key:00010)
+	keys, _, err = collect(db.DescendIterator("", "key:00020", "key:00010"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 10 || keys[0] != "key:00020" || keys[9] != "key:00011" {
+		t.Fatalf("bad range: %v", keys)
+	}
+	// ordered by index values
+	keys, vals, err = collect(db.AscendIterator("num", "1050", "1055"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 5 {
+		t.Fatalf("expected %v, got %v", 5, len(keys))
+	}
+	for i := 0; i < 5; i++ {
+		if vals[i] != fmt.Sprintf("%d", i+1050) {
+			t.Fatalf("expected %v, got %v", i+1050, vals[i])
+		}
+		if keys[i] != fmt.Sprintf("key:%05d", i+50) {
+			t.Fatalf("expected %v, got %v",
+				fmt.Sprintf("key:%05d", i+50), keys[i])
+		}
+	}
+	// descending by index values
+	keys, vals, err = collect(db.DescendIterator("num", "1054", "1049"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 5 || vals[0] != "1054" || vals[4] != "1050" {
+		t.Fatalf("bad index descend: %v %v", keys, vals)
+	}
+	// invalid index
+	it := db.AscendIterator("nosuchindex", "", "")
+	if it.Next() {
+		t.Fatal("expected no items")
+	}
+	if it.Err() != ErrNotFound {
+		t.Fatalf("expected %v, got %v", ErrNotFound, it.Err())
+	}
+	// calling Next after completion keeps returning false
+	it = db.AscendIterator("", "", "")
+	for it.Next() {
+	}
+	if it.Next() {
+		t.Fatal("expected no items")
+	}
+}
+
+func TestIteratorEmpty(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+	it := db.AscendIterator("", "", "")
+	if it.Next() {
+		t.Fatal("expected no items")
+	}
+	if it.Err() != nil {
+		t.Fatal(it.Err())
+	}
+}
+
+// TestIteratorInsertIntoReadRange verifies that inserting items into the
+// already-read range while an iteration is in progress does not cause the
+// iterator to skip or re-read items.
+func TestIteratorInsertIntoReadRange(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+	n := 1000
+	if err := db.Update(func(tx *Tx) error {
+		for i := 0; i < n; i++ {
+			if _, _, err := tx.Set(fmt.Sprintf("key:%05d", i), "v", nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]int)
+	it := db.AscendIterator("", "", "")
+	count := 0
+	for it.Next() {
+		key := it.Key()
+		seen[key]++
+		count++
+		if count == n/2 {
+			// Halfway through the iteration, insert new items into the
+			// already-read range, at the cursor, and ahead of the cursor.
+			if err := db.Update(func(tx *Tx) error {
+				if _, _, err := tx.Set("key:00001.5", "new", nil); err != nil {
+					return err
+				}
+				if _, _, err := tx.Set("key:00498.5", "new", nil); err != nil {
+					return err
+				}
+				if _, _, err := tx.Set("key:00500.5", "new", nil); err != nil {
+					return err
+				}
+				_, _, err := tx.Set("key:00999.5", "new", nil)
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := it.Err(); err != nil {
+		t.Fatal(err)
+	}
+	// Every pre-existing item must be returned exactly once. Items inserted
+	// behind the cursor must not be revisited.
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("key:%05d", i)
+		if seen[key] != 1 {
+			t.Fatalf("expected %v exactly once, got %v", key, seen[key])
+		}
+	}
+	if seen["key:00001.5"] != 0 || seen["key:00498.5"] != 0 {
+		t.Fatal("items inserted behind the cursor were revisited")
+	}
+	// no duplicates at all
+	for key, cnt := range seen {
+		if cnt != 1 {
+			t.Fatalf("expected %v exactly once, got %v", key, cnt)
+		}
+	}
+}
+
+// TestIteratorDeleteCursor verifies that deleting the cursor key between
+// steps does not cause the iterator to skip the following item.
+func TestIteratorDeleteCursor(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+	n := 500
+	if err := db.Update(func(tx *Tx) error {
+		for i := 0; i < n; i++ {
+			if _, _, err := tx.Set(fmt.Sprintf("key:%05d", i), "v", nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	it := db.AscendIterator("", "", "")
+	for it.Next() {
+		keys = append(keys, it.Key())
+		// delete the item that was just returned
+		key := it.Key()
+		if err := db.Update(func(tx *Tx) error {
+			_, err := tx.Delete(key)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := it.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != n {
+		t.Fatalf("expected %v, got %v", n, len(keys))
+	}
+	for i := 0; i < n; i++ {
+		if keys[i] != fmt.Sprintf("key:%05d", i) {
+			t.Fatalf("expected %v, got %v",
+				fmt.Sprintf("key:%05d", i), keys[i])
+		}
+	}
+}
+
+// TestIteratorConcurrentWrites runs an iteration while a writer goroutine
+// continuously inserts and deletes items, and verifies that the items that
+// remain stable for the whole iteration are returned exactly once.
+func TestIteratorConcurrentWrites(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+	n := 2000
+	if err := db.Update(func(tx *Tx) error {
+		for i := 0; i < n; i++ {
+			if _, _, err := tx.Set(fmt.Sprintf("key:%05d", i), "v", nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// keep mutating the already-read range
+			_ = db.Update(func(tx *Tx) error {
+				if _, _, err := tx.Set(fmt.Sprintf("tmp:%05d", i%100), "x", nil); err != nil {
+					return err
+				}
+				if i > 0 {
+					_, _ = tx.Delete(fmt.Sprintf("tmp:%05d", (i-1)%100))
+				}
+				return nil
+			})
+		}
+	}()
+	seen := make(map[string]int)
+	it := db.AscendIterator("", "key:", "key;")
+	for it.Next() {
+		seen[it.Key()]++
+	}
+	close(stop)
+	<-done
+	if err := it.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != n {
+		t.Fatalf("expected %v distinct keys, got %v", n, len(seen))
+	}
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("key:%05d", i)
+		if seen[key] != 1 {
+			t.Fatalf("expected %v exactly once, got %v", key, seen[key])
+		}
+	}
+}

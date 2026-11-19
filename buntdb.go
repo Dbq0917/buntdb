@@ -1962,6 +1962,171 @@ func (tx *Tx) DescendEqual(index, pivot string,
 	})
 }
 
+// Iterator iterates over the items in a range one at a time.
+//
+// Unlike the Ascend* and Descend* methods, which hold a read lock for the
+// entire scan, an Iterator only holds the database read lock while fetching
+// the next item and releases it between steps. This allows long-running
+// operations, such as exporting a report, to run concurrently with writers
+// without blocking them, and without buffering the entire result set in
+// memory.
+//
+// The iterator tracks its position with the key of the last returned item
+// rather than a numeric position, so items that are inserted into the
+// already-read range are never revisited and no item is ever skipped, even
+// when the cursor key itself is deleted between steps. Every item that
+// exists for the entire duration of the iteration is returned exactly once.
+// Items that are inserted ahead of the cursor may or may not be returned,
+// and items that are modified or deleted while the iteration is in progress
+// may be returned in their old or new form, or not at all.
+//
+// An Iterator is not safe for concurrent use by multiple goroutines.
+type Iterator struct {
+	db     *DB    // the underlying database
+	index  string // the index to iterate, empty for the keys tree
+	desc   bool   // true for descending order
+	start  string // inclusive bound, empty for open-ended
+	stop   string // exclusive bound, empty for open-ended
+	key    string // key of the most recently returned item
+	val    string // value of the most recently returned item
+	cursor bool   // true once the first item has been returned
+	done   bool   // true when the iteration has completed
+	err    error  // the first error encountered, if any
+}
+
+// AscendIterator returns an iterator over the items in the database within
+// the range [greaterOrEqual, lessThan), in ascending order.
+// An empty string for either bound means that the bound is open-ended.
+// When an index is provided, the results will be ordered by the item values
+// as specified by the less() function of the defined index.
+// When an index is not provided, the results will be ordered by the item
+// key.
+func (db *DB) AscendIterator(index, greaterOrEqual, lessThan string,
+) *Iterator {
+	return &Iterator{
+		db: db, index: index, start: greaterOrEqual, stop: lessThan,
+	}
+}
+
+// DescendIterator returns an iterator over the items in the database within
+// the range [lessOrEqual, greaterThan), in descending order.
+// An empty string for either bound means that the bound is open-ended.
+// When an index is provided, the results will be ordered by the item values
+// as specified by the less() function of the defined index.
+// When an index is not provided, the results will be ordered by the item
+// key.
+func (db *DB) DescendIterator(index, lessOrEqual, greaterThan string,
+) *Iterator {
+	return &Iterator{
+		db: db, index: index, desc: true, start: lessOrEqual, stop: greaterThan,
+	}
+}
+
+// Next advances the iterator and returns true if there is an item available
+// at the new position. When Next returns false the iteration is complete,
+// or an error occurred which can be retrieved with Err.
+func (it *Iterator) Next() bool {
+	if it.done {
+		return false
+	}
+	it.done = true
+	db := it.db
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		it.err = ErrDatabaseClosed
+		return false
+	}
+	var tr *btree.BTree
+	if it.index == "" {
+		tr = db.keys
+	} else {
+		idx := db.idxs[it.index]
+		if idx == nil {
+			it.err = ErrNotFound
+			return false
+		}
+		tr = idx.btr
+		if tr == nil {
+			return false
+		}
+	}
+	// create the limit items
+	var itemA, itemB *dbItem
+	if it.index == "" {
+		itemA = &dbItem{key: it.start}
+		itemB = &dbItem{key: it.stop}
+	} else {
+		itemA = &dbItem{val: it.start}
+		itemB = &dbItem{val: it.stop}
+		if it.desc {
+			itemA.keyless = true
+			itemB.keyless = true
+		}
+	}
+	// Seek from the cursor when one has been established, otherwise seek
+	// from the start bound. The cursor is the last returned item, so the
+	// seek lands on or immediately after it regardless of any inserts or
+	// deletes that happened in the already-read range since the previous
+	// step.
+	var seek interface{}
+	if it.cursor {
+		seek = &dbItem{key: it.key, val: it.val}
+	} else if it.start != "" {
+		seek = itemA
+	}
+	iter := func(item interface{}) bool {
+		dbi := item.(*dbItem)
+		if it.cursor && dbi.key == it.key {
+			// This is the cursor item itself. It has already been
+			// returned, so skip it. If the cursor key was deleted since
+			// the last step this branch simply never matches and the
+			// first unread item is taken instead, so nothing is skipped.
+			return true
+		}
+		if it.stop != "" {
+			// check the stop bound
+			if it.desc {
+				if !bGT(tr, dbi, itemB) {
+					return false
+				}
+			} else if !bLT(tr, dbi, itemB) {
+				return false
+			}
+		}
+		if dbi.expired() {
+			return true
+		}
+		it.key, it.val = dbi.key, dbi.val
+		it.cursor = true
+		it.done = false
+		return false
+	}
+	if it.desc {
+		tr.Descend(seek, iter)
+	} else {
+		tr.Ascend(seek, iter)
+	}
+	return !it.done
+}
+
+// Key returns the key of the item at the current iterator position.
+// Only valid after a call to Next that returned true.
+func (it *Iterator) Key() string {
+	return it.key
+}
+
+// Value returns the value of the item at the current iterator position.
+// Only valid after a call to Next that returned true.
+func (it *Iterator) Value() string {
+	return it.val
+}
+
+// Err returns the first error encountered by the iterator, if any.
+func (it *Iterator) Err() error {
+	return it.err
+}
+
 // rect is used by Intersects and Nearby
 type rect struct {
 	min, max []float64

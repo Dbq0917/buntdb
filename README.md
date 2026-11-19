@@ -145,6 +145,21 @@ err := db.View(func(tx *buntdb.Tx) error {
 
 There is also `AscendGreaterOrEqual`, `AscendLessThan`, `AscendRange`, `AscendEqual`, `Descend`, `DescendLessOrEqual`, `DescendGreaterThan`, `DescendRange`, and `DescendEqual`. Please see the [documentation](https://godoc.org/github.com/tidwall/buntdb) for more information on these functions.
 
+### Iterating without holding a lock
+The `Ascend*` and `Descend*` methods hold a read lock for the entire scan, which blocks writers for as long as the scan takes. For long-running operations such as exporting a report, use `AscendIterator` or `DescendIterator` instead. These return an `Iterator` that fetches one item at a time and releases the lock between steps, so writers are never blocked and the results are not buffered in memory:
+
+```go
+it := db.AscendIterator("", "user:0000", "user:9999")
+for it.Next() {
+	fmt.Printf("key: %s, value: %s\n", it.Key(), it.Value())
+}
+if err := it.Err(); err != nil {
+	log.Fatal(err)
+}
+```
+
+The iterator tracks its position by key rather than by offset, so items inserted into the already-read range while iterating are never revisited and no item is skipped, even if the item at the cursor is deleted between steps. Every item that exists for the entire iteration is returned exactly once.
+
 
 ## Custom Indexes
 Initially all data is stored in a single [B-tree](https://en.wikipedia.org/wiki/B-tree) with each item having one key and one value. All of these items are ordered by the key. This is great for quickly getting a value from a key or [iterating](#iterating) over the keys. Feel free to peruse the [B-tree implementation](https://github.com/tidwall/btree).

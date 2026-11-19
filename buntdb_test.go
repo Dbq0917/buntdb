@@ -1024,6 +1024,52 @@ func TestVariousTx(t *testing.T) {
 	}
 }
 
+func TestTxViewReadOwnWrites(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+
+	err := db.Update(func(tx *Tx) error {
+		if _, _, err := tx.Set("key", "new", nil); err != nil {
+			return err
+		}
+		return tx.View(func(view *Tx) error {
+			value, err := view.Get("key")
+			if err != nil {
+				return err
+			}
+			if value != "new" {
+				t.Fatalf("expected %q, got %q", "new", value)
+			}
+			if _, _, err := view.Set("key", "other", nil); err != ErrTxNotWritable {
+				t.Fatalf("expected %v, got %v", ErrTxNotWritable, err)
+			}
+			if err := view.Rollback(); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := tx.Set("after-view", "ok", nil); err != nil {
+				t.Fatal(err)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.View(func(tx *Tx) error {
+		value, err := tx.Get("key")
+		if err != nil {
+			return err
+		}
+		if value != "new" {
+			t.Fatalf("expected %q, got %q", "new", value)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestNearby(t *testing.T) {
 	rand.Seed(time.Now().UnixNano())
 	N := 100000

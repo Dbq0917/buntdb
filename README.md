@@ -83,6 +83,38 @@ Transactions run in a function that exposes a `Tx` object, which represents the 
 
 When a transaction fails, it will roll back, and revert all changes that occurred to the database during that transaction. There's a single return value that you can use to close the transaction. For read/write transactions, returning an error this way will force the transaction to roll back. When a read/write transaction succeeds all changes are persisted to disk.
 
+Reads performed through the transaction see that transaction's writes immediately, including writes that have not been committed yet. For a query path that can run either by itself or as part of a write transaction, both `DB` and `Tx` provide a `View` method:
+
+```go
+type viewer interface {
+	View(func(tx *buntdb.Tx) error) error
+}
+
+func findValue(v viewer, key string) (string, error) {
+	var value string
+	err := v.View(func(tx *buntdb.Tx) error {
+		var err error
+		value, err = tx.Get(key)
+		return err
+	})
+	return value, err
+}
+
+err := db.Update(func(tx *buntdb.Tx) error {
+	if _, _, err := tx.Set("mykey", "myvalue", nil); err != nil {
+		return err
+	}
+	// This read sees "myvalue" even though the transaction is uncommitted.
+	_, err := findValue(tx, "mykey")
+	return err
+})
+
+// Outside a transaction, the same query uses a regular read-only transaction.
+value, err := findValue(db, "mykey")
+```
+
+Outside a transaction, continue to use `DB.View`. `Tx.View` does not change the database isolation level and does not expose uncommitted writes to other read transactions.
+
 ### Read-only Transactions
 A read-only transaction should be used when you don't need to make changes to the data. The advantage of a read-only transaction is that there can be many running concurrently.
 

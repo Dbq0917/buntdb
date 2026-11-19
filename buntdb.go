@@ -1056,6 +1056,24 @@ func (db *DB) View(fn func(tx *Tx) error) error {
 	return db.managed(false, fn)
 }
 
+// View executes a function within a read-only view of the transaction state.
+// The view shares the transaction's data, so reads include changes made
+// earlier in the same transaction, including uncommitted writes.
+//
+// View does not acquire a new database lock and does not close or modify the
+// transaction. It is intended for transaction-aware read paths that would
+// otherwise open a separate read-only transaction.
+func (tx *Tx) View(fn func(tx *Tx) error) error {
+	if tx.db == nil {
+		return ErrTxClosed
+	}
+	view := &Tx{
+		db:     tx.db,
+		shared: true,
+	}
+	return fn(view)
+}
+
 // Update executes a function within a managed read/write transaction.
 // The transaction has been committed when no error is returned.
 // In the event that an error is returned, the transaction will be rolled back.
@@ -1087,6 +1105,7 @@ type Tx struct {
 	db       *DB             // the underlying database.
 	writable bool            // when false mutable operations fail.
 	funcd    bool            // when true Commit and Rollback panic.
+	shared   bool            // when true this is a view of another transaction.
 	wc       *txWriteContext // context for writable transactions.
 }
 
@@ -1177,6 +1196,9 @@ func (tx *Tx) lock() {
 
 // unlock unlocks the database based on the transaction type.
 func (tx *Tx) unlock() {
+	if tx.shared {
+		return
+	}
 	if tx.writable {
 		tx.db.mu.Unlock()
 	} else {

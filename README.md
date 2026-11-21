@@ -547,6 +547,11 @@ As you may guess this log file can grow large over time.
 There's a background routine that automatically shrinks the log file when it gets too large.
 There is also a `Shrink()` function which will rewrite the aof file so that it contains only the items in the database.
 The shrink operation does not lock up the database so read and write transactions can continue while shrinking is in process.
+The rewrite runs as a series of bounded steps so a writer is only ever blocked for the short time it takes to serialize a single small chunk:
+
+- The live keyspace is scanned in small chunks under a read lock; each chunk is flushed to a temporary file after the lock is released, and a single reused buffer keeps the extra memory usage constant regardless of database size.
+- AOF commands committed during the scan are appended without holding any lock, looping until only a small tail remains.
+- The write lock is taken only at the very end to append that bounded tail, sync and atomically swap the files, so write latency stays low and no multi-second stall occurs even for large files.
 
 ### Durability and fsync
 

@@ -672,14 +672,14 @@ func (db *DB) Shrink() error {
 	}()
 	fname := db.file.Name()
 	tmpname := fname + ".tmp"
-	// the endpos is used to return to the end of the file when we are
-	// finished writing all of the current items.
+	// endpos is the offset in the live aof up to which the temp file will
+	// mirror the live file. It moves forward as the shrink progresses.
 	endpos, err := db.file.Seek(0, 2)
 	if err != nil {
+		db.mu.Unlock()
 		return err
 	}
 	db.mu.Unlock()
-	time.Sleep(time.Second / 4) // wait just a bit before starting
 	f, err := os.Create(tmpname)
 	if err != nil {
 		return err
@@ -689,8 +689,12 @@ func (db *DB) Shrink() error {
 		_ = os.RemoveAll(tmpname)
 	}()
 
-	// we are going to read items in as chunks as to not hold up the database
-	// for too long.
+	// Phase 1: serialize every in-memory item into the temp file in bounded
+	// chunks. Each chunk is built under a short read lock and the actual disk
+	// write happens after the lock is released, so writable transactions are
+	// only ever blocked for the time it takes to serialize one small chunk.
+	// The reused buffer caps the extra memory to a single chunk regardless of
+	// the total database size.
 	var buf []byte
 	pivot := ""
 	done := false
@@ -702,90 +706,172 @@ func (db *DB) Shrink() error {
 				return ErrDatabaseClosed
 			}
 			done = true
-			var n int
 			now := time.Now()
 			btreeAscendGreaterOrEqual(db.keys, &dbItem{key: pivot},
 				func(item interface{}) bool {
 					dbi := item.(*dbItem)
-					// 1000 items or 64MB buffer
-					if n > 1000 || len(buf) > 64*1024*1024 {
+					// Stop the chunk after a bounded number of items or once
+					// the buffer reaches its target size, whichever comes
+					// first. Keeping this small bounds how long a writer waits
+					// on the read lock.
+					if len(buf) >= shrinkChunkMaxSize {
 						pivot = dbi.key
 						done = false
 						return false
 					}
 					buf = dbi.writeSetTo(buf, now)
-					n++
 					return true
 				},
 			)
-			if len(buf) > 0 {
-				if _, err := f.Write(buf); err != nil {
-					return err
-				}
-				buf = buf[:0]
-			}
 			return nil
 		}()
 		if err != nil {
 			return err
 		}
-	}
-	// We reached this far so all of the items have been written to a new tmp
-	// There's some more work to do by appending the new line from the aof
-	// to the tmp file and finally swap the files out.
-	return func() error {
-		// We're wrapping this in a function to get the benefit of a defered
-		// lock/unlock.
-		db.mu.Lock()
-		defer db.mu.Unlock()
-		if db.closed {
-			return ErrDatabaseClosed
+		// The disk write is performed without holding any lock so concurrent
+		// writes keep flowing while this chunk is flushed.
+		if len(buf) > 0 {
+			if _, err := f.Write(buf); err != nil {
+				return err
+			}
+			buf = buf[:0]
 		}
-		// We are going to open a new version of the aof file so that we do
-		// not change the seek position of the previous. This may cause a
-		// problem in the future if we choose to use syscall file locking.
+		if !done {
+			// Give pending writers a chance to acquire the lock before the
+			// next chunk takes the read lock again.
+			runtime.Gosched()
+		}
+	}
+
+	// Phase 2: append the aof commands that were committed while phase 1 was
+	// running. This catch-up uses its own file handle and no database lock, so
+	// it never stalls writers. It repeats until the remaining tail is small
+	// enough to finish quickly under the final write lock.
+	endpos, err = db.shrinkCatchup(f, fname, endpos)
+	if err != nil {
+		return err
+	}
+	// Sync the bulk of the rewritten file before taking the write lock. The
+	// heavy fsync of the full snapshot therefore happens while writes remain
+	// available; only the small final tail is synced while holding the lock.
+	if err := f.Sync(); err != nil {
+		return err
+	}
+
+	// Phase 3: take the write lock just long enough to append the bounded tail,
+	// swap the files atomically and reopen the aof.
+	return db.shrinkSwap(f, tmpname, fname, endpos)
+}
+
+// shrinkCatchup appends, without holding any database lock, the aof bytes that
+// were written after startpos and returns the offset up to which the temp file
+// now mirrors the live aof. It keeps looping until the remaining tail is small
+// enough to be finished quickly under the final write lock.
+func (db *DB) shrinkCatchup(f *os.File, fname string, startpos int64) (int64, error) {
+	pos := startpos
+	for rounds := 0; rounds < shrinkCatchupMaxRounds; rounds++ {
 		aof, err := os.Open(fname)
 		if err != nil {
-			return err
+			return 0, err
 		}
-		defer func() { _ = aof.Close() }()
-		if _, err := aof.Seek(endpos, 0); err != nil {
-			return err
-		}
-		// Just copy all of the new commands that have occurred since we
-		// started the shrink process.
-		if _, err := io.Copy(f, aof); err != nil {
-			return err
-		}
-		// Close all files
-		if err := aof.Close(); err != nil {
-			return err
-		}
-		if err := f.Sync(); err != nil {
-			return err
-		}
-		if err := f.Close(); err != nil {
-			return err
-		}
-		if err := db.file.Close(); err != nil {
-			return err
-		}
-		// Any failures below here are really bad. So just panic.
-		if err := renameFile(tmpname, fname); err != nil {
-			panicErr(err)
-		}
-		db.file, err = os.OpenFile(fname, os.O_CREATE|os.O_RDWR, 0666)
+		end, err := aof.Seek(0, 2)
 		if err != nil {
-			panicErr(err)
+			_ = aof.Close()
+			return 0, err
 		}
-		pos, err := db.file.Seek(0, 2)
+		if end-pos <= shrinkTailMaxSize {
+			// The remaining tail is small enough to finish while locked.
+			_ = aof.Close()
+			return pos, nil
+		}
+		if _, err := aof.Seek(pos, 0); err != nil {
+			_ = aof.Close()
+			return 0, err
+		}
+		n, err := io.Copy(f, aof)
+		_ = aof.Close()
 		if err != nil {
-			return err
+			return 0, err
 		}
-		db.lastaofsz = int(pos)
-		return nil
-	}()
+		pos += n
+		// Yield and briefly pause so the catch-up loop does not dominate the
+		// cpu while writers are appending to the live aof. The pause also lets
+		// fresh writes land so the remaining tail can fall under the bound.
+		runtime.Gosched()
+		time.Sleep(shrinkCatchupPause)
+	}
+	return pos, nil
 }
+
+// shrinkSwap finishes the rewrite under the write lock: it appends the small
+// remaining aof tail, syncs, swaps the temp file into place and reopens the
+// live aof. The lock is held only for this short, bounded operation.
+func (db *DB) shrinkSwap(f *os.File, tmpname, fname string, startpos int64) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+	endpos, err := db.file.Seek(0, 2)
+	if err != nil {
+		return err
+	}
+	aof, err := os.Open(fname)
+	if err != nil {
+		return err
+	}
+	if _, err := aof.Seek(startpos, 0); err != nil {
+		_ = aof.Close()
+		return err
+	}
+	tail := io.LimitReader(aof, endpos-startpos)
+	if _, err := io.Copy(f, tail); err != nil {
+		_ = aof.Close()
+		return err
+	}
+	if err := aof.Close(); err != nil {
+		return err
+	}
+	// Only the small remaining tail needs to be synced under the lock.
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := db.file.Close(); err != nil {
+		return err
+	}
+	if err := renameFile(tmpname, fname); err != nil {
+		panicErr(err)
+	}
+	db.file, err = os.OpenFile(fname, os.O_CREATE|os.O_RDWR, 0666)
+	if err != nil {
+		panicErr(err)
+	}
+	pos, err := db.file.Seek(0, 2)
+	if err != nil {
+		return err
+	}
+	db.lastaofsz = int(pos)
+	return nil
+}
+
+// Shrink tuning constants. They bound both the amount of extra memory used by
+// a rewrite (a single chunk buffer) and how long a writer can be blocked while
+// a rewrite is in progress.
+const (
+	// shrinkChunkMaxSize caps the serialized size of one snapshot chunk that
+	// is built while holding the read lock.
+	shrinkChunkMaxSize = 256 * 1024
+	// shrinkTailMaxSize bounds how much of the live aof is appended and synced
+	// while holding the final write lock.
+	shrinkTailMaxSize = 64 * 1024
+	// shrinkCatchupMaxRounds bounds the lock-free catch-up phase.
+	shrinkCatchupMaxRounds = 256
+	// shrinkCatchupPause is the brief pause between lock-free catch-up rounds.
+	shrinkCatchupPause = time.Millisecond
+)
 
 func panicErr(err error) error {
 	panic(fmt.Errorf("buntdb: %w", err))

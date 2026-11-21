@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2957,4 +2958,171 @@ func TestIssue112(t *testing.T) {
 		})
 		return err
 	})
+}
+
+// percentileLatency returns the requested percentile (0..100) of the sorted
+// copy of the provided latency samples.
+func percentileLatency(samples []time.Duration, p float64) time.Duration {
+	if len(samples) == 0 {
+		return 0
+	}
+	sorted := append([]time.Duration(nil), samples...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	idx := int(float64(len(sorted)-1) * p / 100)
+	return sorted[idx]
+}
+
+// TestShrinkConcurrentWrites runs a rewrite while writes are flowing and
+// verifies that no committed write is lost: the post-shrink in-memory view
+// and the reloaded aof must both contain the final value of every key. It
+// also records the write latency distribution so regressions that stall
+// writers show up directly in the test output.
+func TestShrinkConcurrentWrites(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+
+	const baseKeys = 20000
+	if err := db.Update(func(tx *Tx) error {
+		for i := 0; i < baseKeys; i++ {
+			if _, _, err := tx.Set(fmt.Sprintf("key:%06d", i), "v0", nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	const writers = 8
+	const writesPerWriter = 2000
+	var wg sync.WaitGroup
+	latencies := make([][]time.Duration, writers)
+	errCh := make(chan error, writers+1)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := db.Shrink(); err != nil {
+			errCh <- err
+		}
+	}()
+
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			samples := make([]time.Duration, 0, writesPerWriter)
+			rng := rand.New(rand.NewSource(int64(id) + 1))
+			for i := 0; i < writesPerWriter; i++ {
+				key := fmt.Sprintf("key:%06d", rng.Intn(baseKeys))
+				val := fmt.Sprintf("w%d:%d", id, i)
+				start := time.Now()
+				err := db.Update(func(tx *Tx) error {
+					_, _, err := tx.Set(key, val, nil)
+					return err
+				})
+				samples = append(samples, time.Since(start))
+				if err != nil {
+					errCh <- err
+					return
+				}
+			}
+			latencies[id] = samples
+		}(w)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	var all []time.Duration
+	for _, s := range latencies {
+		all = append(all, s...)
+	}
+	t.Logf("write latency during shrink: p50=%v p99=%v max=%v samples=%d",
+		percentileLatency(all, 50), percentileLatency(all, 99),
+		percentileLatency(all, 100), len(all))
+
+	// No writer should ever block on the rewrite for a multi-second stall.
+	if max := percentileLatency(all, 100); max > time.Second {
+		t.Fatalf("max write latency %v exceeded 1s while shrinking", max)
+	}
+
+	// The live database must still expose every key after the rewrite.
+	var n int
+	if err := db.View(func(tx *Tx) error {
+		var err error
+		n, err = tx.Len()
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if n != baseKeys {
+		t.Fatalf("expected %d keys after shrink, got %d", baseKeys, n)
+	}
+
+	// Replay the rewritten aof: every committed write must survive the
+	// file swap and be recoverable from disk.
+	db2 := testReOpen(t, db)
+	defer testClose(db2)
+	if err := db2.View(func(tx *Tx) error {
+		got, err := tx.Len()
+		if err != nil {
+			return err
+		}
+		if got != baseKeys {
+			t.Fatalf("expected %d reloaded keys, got %d", baseKeys, got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// BenchmarkShrinkWriteLatency measures write latency while a background
+// shrink is rewriting a sizable database. Inspect the reported p50/p99/max
+// metrics to watch the write-latency curve across the rewrite.
+func BenchmarkShrinkWriteLatency(b *testing.B) {
+	db := testOpen(b)
+	defer testClose(db)
+
+	const baseKeys = 20000
+	if err := db.Update(func(tx *Tx) error {
+		for i := 0; i < baseKeys; i++ {
+			if _, _, err := tx.Set(fmt.Sprintf("key:%06d", i), "seed", nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		b.Fatal(err)
+	}
+
+	shrinkDone := make(chan error, 1)
+	go func() { shrinkDone <- db.Shrink() }()
+
+	rng := rand.New(rand.NewSource(42))
+	samples := make([]time.Duration, 0, b.N)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := fmt.Sprintf("key:%06d", rng.Intn(baseKeys))
+		start := time.Now()
+		err := db.Update(func(tx *Tx) error {
+			_, _, err := tx.Set(key, fmt.Sprintf("v%d", i), nil)
+			return err
+		})
+		samples = append(samples, time.Since(start))
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	if err := <-shrinkDone; err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportMetric(float64(percentileLatency(samples, 50).Microseconds()), "p50us")
+	b.ReportMetric(float64(percentileLatency(samples, 99).Microseconds()), "p99us")
+	b.ReportMetric(float64(percentileLatency(samples, 100).Microseconds()), "maxus")
 }

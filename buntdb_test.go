@@ -1488,6 +1488,140 @@ func TestInsertsAndDeleted(t *testing.T) {
 	}
 }
 
+// TestIndexReordersOnValueUpdate ensures that replacing an item's value
+// reorders it inside every matching secondary index without rebuilding the
+// whole index. A stale index position would surface as a duplicate or missing
+// row while paging through the index in range order.
+func TestIndexReordersOnValueUpdate(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+	if err := db.CreateIndex("ages", "*", IndexInt); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		for i := 0; i < 10; i++ {
+			if _, _, err := tx.Set(fmt.Sprintf("user:%02d", i),
+				strconv.Itoa(i*10), nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Move three values to new positions inside a single transaction.
+	if err := db.Update(func(tx *Tx) error {
+		moves := map[string]string{
+			"user:01": "95",
+			"user:08": "5",
+			"user:04": "500",
+		}
+		for key, val := range moves {
+			if _, _, err := tx.Set(key, val, nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		"user:00=0",
+		"user:08=5",
+		"user:02=20",
+		"user:03=30",
+		"user:05=50",
+		"user:06=60",
+		"user:07=70",
+		"user:09=90",
+		"user:01=95",
+		"user:04=500",
+	}
+	var got []string
+	if err := db.View(func(tx *Tx) error {
+		return tx.Ascend("ages", func(key, value string) bool {
+			got = append(got, key+"="+value)
+			return true
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("index row count mismatch:\n got %v\nwant %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("index order mismatch:\n got %v\nwant %v", got, want)
+		}
+	}
+
+	// Simulate paging the index in fixed-size windows. Every row must appear
+	// exactly once, which catches stale entries that duplicate or hide a row.
+	seen := make(map[string]bool, len(want))
+	const pageSize = 3
+	for start := 0; start < len(got); start += pageSize {
+		end := start + pageSize
+		if end > len(got) {
+			end = len(got)
+		}
+		for _, row := range got[start:end] {
+			key := row[:strings.IndexByte(row, '=')]
+			if seen[key] {
+				t.Fatalf("row %s returned twice while paging", key)
+			}
+			seen[key] = true
+		}
+	}
+	if len(seen) != len(want) {
+		t.Fatalf("paging visited %d unique rows, want %d", len(seen), len(want))
+	}
+}
+
+// TestIndexUpdateWithPatterns ensures that replacing an item removes it from
+// the exact index instances that held the previous value, including pattern
+// indexes that only accept a subset of the keys.
+func TestIndexUpdateWithPatterns(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+	if err := db.Update(func(tx *Tx) error {
+		if err := tx.CreateIndex("evens", "user:*", IndexInt); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("user:1", "10", nil); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("other:1", "20", nil); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("user:1", "99", nil)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var rows []string
+	if err := db.View(func(tx *Tx) error {
+		return tx.Ascend("evens", func(key, value string) bool {
+			rows = append(rows, key+"="+value)
+			return true
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"user:1=99"}
+	if len(rows) != len(want) || rows[0] != want[0] {
+		t.Fatalf("pattern index mismatch:\n got %v\nwant %v", rows, want)
+	}
+}
+
 func TestInsertDoesNotMisuseIndex(t *testing.T) {
 	db := testOpen(t)
 	defer testClose(db)

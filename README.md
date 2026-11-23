@@ -204,6 +204,11 @@ db.CreateIndex("names", "user:*", buntdb.IndexString)
 
 Now only items with keys that have the prefix `user:` will be added to the `names` index.
 
+### Keeping indexes in sync
+Indexes are maintained incrementally as part of each write transaction, so they never require a full rebuild to reflect a changed value. When an item is replaced with `Set`, the previous entry is first removed from every b-tree or r-tree index that holds it and the new entry is then inserted into every index matching its key. The set of indexes to remove from is derived from the previous item's own key, which keeps removal and insertion correct even when pattern-based indexes would match the two entries differently. An item removed with `Delete` follows the same per-index cleanup.
+
+Because the index is updated in the same transaction as the primary data, a range or paging scan observed after a successful commit always sees the new ordering exactly once per item: there is no window in which an item appears in both its old and new index positions or in neither.
+
 
 ### Built-in types
 Along with `IndexString`, there is also `IndexInt`, `IndexUint`, and `IndexFloat`.

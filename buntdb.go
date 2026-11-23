@@ -73,7 +73,6 @@ type DB struct {
 	keys      *btree.BTree      // a tree of all item ordered by key
 	exps      *btree.BTree      // a tree of items ordered by expiration
 	idxs      map[string]*index // the index trees.
-	insIdxs   []*index          // a reuse buffer for gathering indexes
 	flushes   int               // a count of the number of disk flushes
 	closed    bool              // set when the database has been closed
 	config    Config            // the database configuration
@@ -460,8 +459,8 @@ func (db *DB) SetConfig(config Config) error {
 // will be replaced with the new one, and return the previous item.
 func (db *DB) insertIntoDatabase(item *dbItem) *dbItem {
 	var pdbi *dbItem
-	// Generate a list of indexes that this item will be inserted in to.
-	idxs := db.insIdxs
+	// Generate a list of indexes that the new item will be inserted into.
+	var idxs []*index
 	for _, idx := range db.idxs {
 		if idx.match(item.key) {
 			idxs = append(idxs, idx)
@@ -470,29 +469,25 @@ func (db *DB) insertIntoDatabase(item *dbItem) *dbItem {
 	prev := db.keys.Set(item)
 	if prev != nil {
 		// A previous item was removed from the keys tree. Let's
-		// fully delete this item from all indexes.
+		// fully delete this item from every index that held it. The
+		// indexes containing the previous item are derived from its own
+		// key instead of the new item's matching set, because the two sets
+		// can differ when key patterns are in use. Removing from the wrong
+		// set would leave stale entries behind, while inserting the new
+		// item below takes care of every index it now belongs to.
 		pdbi = prev.(*dbItem)
 		if pdbi.opts != nil && pdbi.opts.ex {
 			// Remove it from the expires tree.
 			db.exps.Delete(pdbi)
 		}
-		for _, idx := range idxs {
-			if idx.btr != nil {
-				// Remove it from the btree index.
-				idx.btr.Delete(pdbi)
-			}
-			if idx.rtr != nil {
-				// Remove it from the rtree index.
-				idx.rtr.Remove(pdbi)
-			}
-		}
+		db.deleteItemFromIndexes(pdbi)
 	}
 	if item.opts != nil && item.opts.ex {
 		// The new item has eviction options. Add it to the
 		// expires tree
 		db.exps.Set(item)
 	}
-	for i, idx := range idxs {
+	for _, idx := range idxs {
 		if idx.btr != nil {
 			// Add new item to btree index.
 			idx.btr.Set(item)
@@ -501,13 +496,29 @@ func (db *DB) insertIntoDatabase(item *dbItem) *dbItem {
 			// Add new item to rtree index.
 			idx.rtr.Insert(item)
 		}
-		// clear the index
-		idxs[i] = nil
 	}
-	// reuse the index list slice
-	db.insIdxs = idxs[:0]
 	// we must return the previous item to the caller.
 	return pdbi
+}
+
+// deleteItemFromIndexes removes an item from every b-tree or r-tree index
+// whose pattern matches the item's key. The item passed in must be the
+// instance currently stored in the indexes so that value-based ordering and
+// spatial rectangles resolve to the position that needs to be removed.
+func (db *DB) deleteItemFromIndexes(item *dbItem) {
+	for _, idx := range db.idxs {
+		if !idx.match(item.key) {
+			continue
+		}
+		if idx.btr != nil {
+			// Remove it from the btree index.
+			idx.btr.Delete(item)
+		}
+		if idx.rtr != nil {
+			// Remove it from the rtree index.
+			idx.rtr.Remove(item)
+		}
+	}
 }
 
 // deleteFromDatabase removes and item from the database and indexes. The input
@@ -525,19 +536,7 @@ func (db *DB) deleteFromDatabase(item *dbItem) *dbItem {
 			// Remove it from the exipres tree.
 			db.exps.Delete(pdbi)
 		}
-		for _, idx := range db.idxs {
-			if !idx.match(pdbi.key) {
-				continue
-			}
-			if idx.btr != nil {
-				// Remove it from the btree index.
-				idx.btr.Delete(pdbi)
-			}
-			if idx.rtr != nil {
-				// Remove it from the rtree index.
-				idx.rtr.Remove(pdbi)
-			}
-		}
+		db.deleteItemFromIndexes(pdbi)
 	}
 	return pdbi
 }

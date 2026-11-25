@@ -60,6 +60,16 @@ var (
 
 	// ErrTxIterating is returned when Set or Delete are called while iterating.
 	ErrTxIterating = errors.New("tx is iterating")
+
+	// ErrTxConflict is returned when an optimistic transaction cannot be
+	// committed because another transaction committed first.
+	ErrTxConflict = errors.New("tx conflict")
+
+	// ErrConflict is an alias for ErrTxConflict.
+	ErrConflict = ErrTxConflict
+
+	// ErrSerializationFailure is an alias for ErrTxConflict.
+	ErrSerializationFailure = ErrTxConflict
 )
 
 const useAbsEx = true
@@ -67,19 +77,209 @@ const useAbsEx = true
 // DB represents a collection of key-value pairs that persist on disk.
 // Transactions are used for all forms of data access to the DB.
 type DB struct {
-	mu        sync.RWMutex      // the gatekeeper for all fields
-	file      *os.File          // the underlying file
-	buf       []byte            // a buffer to write to
-	keys      *btree.BTree      // a tree of all item ordered by key
-	exps      *btree.BTree      // a tree of items ordered by expiration
-	idxs      map[string]*index // the index trees.
-	insIdxs   []*index          // a reuse buffer for gathering indexes
-	flushes   int               // a count of the number of disk flushes
-	closed    bool              // set when the database has been closed
-	config    Config            // the database configuration
-	persist   bool              // do we write to disk
-	shrinking bool              // when an aof shrink is in-process.
-	lastaofsz int               // the size of the last shrink aof size
+	mu         sync.RWMutex      // protects config, file, and lifecycle fields
+	snapshotMu sync.RWMutex      // protects published snapshot and version
+	writeMu    sync.Mutex        // serializes wait-on-conflict writers
+	file       *os.File          // the underlying file
+	buf        []byte            // a buffer to write to
+	keys       *btree.BTree      // a tree of all item ordered by key
+	exps       *btree.BTree      // a tree of items ordered by expiration
+	idxs       map[string]*index // the index trees.
+	insIdxs    []*index          // a reuse buffer for gathering indexes
+	flushes    int               // a count of the number of disk flushes
+	closed     bool              // set when the database has been closed
+	config     Config            // the database configuration
+	persist    bool              // do we write to disk
+	version    uint64            // the current committed snapshot version
+	shrinking  bool              // when an aof shrink is in-process.
+	lastaofsz  int               // the size of the last shrink aof size
+}
+
+// IsolationLevel controls which committed version a transaction is allowed to
+// observe.
+type IsolationLevel uint8
+
+const (
+	// ReadUncommitted is the lowest SQL-style level. BuntDB writers keep
+	// their changes private until commit, so this behaves like ReadCommitted
+	// for committed-data reads and can never expose a dirty value from
+	// another transaction.
+	ReadUncommitted IsolationLevel = 4
+
+	// ReadCommitted refreshes a read-only transaction to the latest committed
+	// snapshot before each statement.
+	ReadCommitted IsolationLevel = 1
+
+	// RepeatableRead pins a consistent snapshot for the whole transaction.
+	RepeatableRead IsolationLevel = 2
+
+	// SnapshotIsolation pins a transaction to the snapshot that was current
+	// when the transaction began.
+	SnapshotIsolation = RepeatableRead
+
+	// SerializableIsolation pins a snapshot and checks for a conflicting
+	// write at commit time. It is the same as SnapshotIsolation for read-only
+	// transactions.
+	SerializableIsolation IsolationLevel = 3
+)
+
+const (
+	// LevelReadUncommitted is an alias for ReadUncommitted.
+	LevelReadUncommitted = ReadUncommitted
+	// LevelReadCommitted is an alias for ReadCommitted.
+	LevelReadCommitted = ReadCommitted
+	// LevelRepeatableRead is an alias for RepeatableRead.
+	LevelRepeatableRead = RepeatableRead
+	// LevelSnapshot is an alias for SnapshotIsolation.
+	LevelSnapshot = SnapshotIsolation
+	// LevelSerializable is an alias for SerializableIsolation.
+	LevelSerializable = SerializableIsolation
+	// IsolationReadUncommitted is an alias for ReadUncommitted.
+	IsolationReadUncommitted = ReadUncommitted
+	// IsolationReadCommitted is an alias for ReadCommitted.
+	IsolationReadCommitted = ReadCommitted
+	// IsolationRepeatableRead is an alias for RepeatableRead.
+	IsolationRepeatableRead = RepeatableRead
+	// IsolationSnapshot is an alias for SnapshotIsolation.
+	IsolationSnapshot = SnapshotIsolation
+	// IsolationSerializable is an alias for SerializableIsolation.
+	IsolationSerializable = SerializableIsolation
+
+	// IsolationLevel* names are aliases for callers that prefer the type
+	// name as a constant prefix.
+	IsolationLevelReadUncommitted = ReadUncommitted
+	IsolationLevelReadCommitted   = ReadCommitted
+	IsolationLevelRepeatableRead  = RepeatableRead
+	IsolationLevelSnapshot        = SnapshotIsolation
+	IsolationLevelSerializable    = SerializableIsolation
+
+	// LevelSnapshotIsolation is an alias for SnapshotIsolation.
+	LevelSnapshotIsolation = SnapshotIsolation
+)
+
+// ConflictResolution is an alternate name for ConflictPolicy.
+type ConflictResolution = ConflictPolicy
+
+// ConflictPolicy controls what a writable transaction does when its starting
+// snapshot has been superseded by another committed transaction.
+type ConflictPolicy uint8
+
+const (
+	// ConflictWait serializes writable transactions from begin to completion.
+	// Writers never observe a conflict under this policy.
+	ConflictWait ConflictPolicy = iota
+
+	// ConflictAbort rolls back the transaction and returns ErrTxConflict when
+	// another transaction has committed since the snapshot was taken.
+	ConflictAbort
+
+	// ConflictOverwrite applies this transaction's key changes to the latest
+	// committed snapshot. Concurrent changes to keys not written by this
+	// transaction are retained, and this transaction's values win for keys it
+	// did write.
+	ConflictOverwrite
+)
+
+const (
+	// ConflictLastWriterWins is an alias for ConflictOverwrite.
+	ConflictLastWriterWins = ConflictOverwrite
+	// ConflictLastWriteWins is an alias for ConflictOverwrite.
+	ConflictLastWriteWins = ConflictOverwrite
+
+	// ResolutionWait is an alias for ConflictWait.
+	ResolutionWait = ConflictWait
+	// ResolutionAbort is an alias for ConflictAbort.
+	ResolutionAbort = ConflictAbort
+	// ResolutionOverwrite is an alias for ConflictOverwrite.
+	ResolutionOverwrite = ConflictOverwrite
+	// ResolutionLastWriterWins is an alias for ConflictLastWriterWins.
+	ResolutionLastWriterWins = ConflictLastWriterWins
+
+	// ConflictPolicy* names are aliases that include the type name.
+	ConflictPolicyWait       = ConflictWait
+	ConflictPolicyAbort      = ConflictAbort
+	ConflictPolicyOverwrite  = ConflictOverwrite
+	ConflictPolicyLastWriter = ConflictLastWriterWins
+	ConflictPolicyLastWrite  = ConflictLastWriteWins
+)
+
+// TxOptions configures the isolation and write-conflict behavior of a
+// transaction. The zero value selects SnapshotIsolation with ConflictWait.
+type TxOptions struct {
+	Isolation IsolationLevel
+
+	// Conflict selects the write/write conflict policy.
+	Conflict ConflictPolicy
+
+	// ConflictPolicy is an alternate name for Conflict. When both are set,
+	// Conflict takes precedence.
+	ConflictPolicy ConflictPolicy
+
+	// Resolution is an alternate name for Conflict. When Conflict or
+	// ConflictPolicy is non-zero, those fields take precedence.
+	Resolution ConflictResolution
+
+	// ConflictResolution is another alternate name for Conflict.
+	ConflictResolution ConflictResolution
+}
+
+// TransactionOptions is an alternate name for TxOptions.
+type TransactionOptions = TxOptions
+
+// IsolationOptions is an alternate name for TxOptions.
+type IsolationOptions = TxOptions
+
+// TxOption mutates transaction options.
+type TxOption func(*TxOptions)
+
+// WithIsolation sets the isolation level for BeginTx, ViewTx, or UpdateTx.
+func WithIsolation(level IsolationLevel) TxOption {
+	return func(opts *TxOptions) {
+		opts.Isolation = level
+	}
+}
+
+// WithConflict sets the conflict policy for BeginTx or UpdateTx.
+func WithConflict(policy ConflictPolicy) TxOption {
+	return func(opts *TxOptions) {
+		opts.Conflict = policy
+	}
+}
+
+// WithConflictResolution sets the conflict resolution policy.
+func WithConflictResolution(policy ConflictResolution) TxOption {
+	return func(opts *TxOptions) {
+		opts.ConflictResolution = policy
+	}
+}
+
+func normalizeTxOptions(opts *TxOptions) TxOptions {
+	nopts := TxOptions{
+		Isolation: SnapshotIsolation,
+		Conflict:  ConflictWait,
+	}
+	if opts == nil {
+		return nopts
+	}
+	switch opts.Isolation {
+	case ReadUncommitted, ReadCommitted, RepeatableRead, SerializableIsolation:
+		nopts.Isolation = opts.Isolation
+	}
+	policy := opts.Conflict
+	if policy == ConflictWait && opts.ConflictPolicy != ConflictWait {
+		policy = opts.ConflictPolicy
+	}
+	if policy == ConflictWait && opts.Resolution != ConflictWait {
+		policy = opts.Resolution
+	}
+	if policy == ConflictWait && opts.ConflictResolution != ConflictWait {
+		policy = opts.ConflictResolution
+	}
+	switch policy {
+	case ConflictWait, ConflictAbort, ConflictOverwrite:
+		nopts.Conflict = policy
+	}
+	return nopts
 }
 
 // SyncPolicy represents how often data is synced to disk.
@@ -183,6 +383,8 @@ func (db *DB) Close() error {
 		return ErrDatabaseClosed
 	}
 	db.closed = true
+	db.snapshotMu.Lock()
+	defer db.snapshotMu.Unlock()
 	if db.persist {
 		db.file.Sync() // do a sync but ignore the error
 		if err := db.file.Close(); err != nil {
@@ -195,19 +397,28 @@ func (db *DB) Close() error {
 	return nil
 }
 
-// Save writes a snapshot of the database to a writer. This operation blocks all
-// writes, but not reads. This can be used for snapshots and backups for pure
-// in-memory databases using the ":memory:". Database that persist to disk
-// can be snapshotted by simply copying the database file.
+// Save writes a point-in-time snapshot of the database to a writer. The
+// database lock is held only while creating the copy-on-write view; writes can
+// continue while the snapshot is being serialized. This can be used for
+// snapshots and backups for pure in-memory databases using the ":memory:".
+// Databases that persist to disk can also be snapshotted by copying the
+// database file.
 func (db *DB) Save(wr io.Writer) error {
 	var err error
 	db.mu.RLock()
-	defer db.mu.RUnlock()
+	if db.closed {
+		db.mu.RUnlock()
+		return ErrDatabaseClosed
+	}
+	db.snapshotMu.Lock()
+	snapshot := db.keys.Copy()
+	db.snapshotMu.Unlock()
+	db.mu.RUnlock()
+	now := time.Now()
 	// use a buffered writer and flush every 4MB
 	var buf []byte
-	now := time.Now()
 	// iterated through every item in the database and write to the buffer
-	btreeAscend(db.keys, func(item interface{}) bool {
+	btreeAscend(snapshot, func(item interface{}) bool {
 		dbi := item.(*dbItem)
 		buf = dbi.writeSetTo(buf, now)
 		if len(buf) > 1024*1024*4 {
@@ -243,8 +454,13 @@ func (db *DB) Load(rd io.Reader) error {
 		// cannot load into databases that persist to disk
 		return ErrPersistenceActive
 	}
-	_, err := db.readLoad(rd, time.Now())
-	return err
+	if _, err := db.readLoad(rd, time.Now()); err != nil {
+		return err
+	}
+	db.snapshotMu.Lock()
+	db.version++
+	db.snapshotMu.Unlock()
+	return nil
 }
 
 // index represents a b-tree or r-tree index and also acts as the
@@ -297,8 +513,8 @@ func (idx *index) clearCopy() *index {
 	return nidx
 }
 
-// rebuild rebuilds the index
-func (idx *index) rebuild() {
+// rebuild rebuilds the index from the provided key tree.
+func (idx *index) rebuild(keys *btree.BTree) {
 	// initialize trees
 	if idx.less != nil {
 		idx.btr = btreeNew(lessCtx(idx))
@@ -307,7 +523,7 @@ func (idx *index) rebuild() {
 		idx.rtr = rtred.New(idx)
 	}
 	// iterate through all keys and fill the index
-	btreeAscend(idx.db.keys, func(item interface{}) bool {
+	btreeAscend(keys, func(item interface{}) bool {
 		dbi := item.(*dbItem)
 		if !idx.match(dbi.key) {
 			// does not match the pattern, continue
@@ -455,28 +671,30 @@ func (db *DB) SetConfig(config Config) error {
 	return nil
 }
 
-// insertIntoDatabase performs inserts an item in to the database and updates
-// all indexes. If a previous item with the same key already exists, that item
-// will be replaced with the new one, and return the previous item.
-func (db *DB) insertIntoDatabase(item *dbItem) *dbItem {
+// insertIntoDatabase inserts an item into the supplied trees and indexes. If a
+// previous item with the same key already exists, that item is replaced and
+// returned.
+func insertIntoDatabase(keys, exps *btree.BTree, idxs map[string]*index,
+	insIdxs *[]*index, item *dbItem,
+) *dbItem {
 	var pdbi *dbItem
 	// Generate a list of indexes that this item will be inserted in to.
-	idxs := db.insIdxs
-	for _, idx := range db.idxs {
+	idxList := *insIdxs
+	for _, idx := range idxs {
 		if idx.match(item.key) {
-			idxs = append(idxs, idx)
+			idxList = append(idxList, idx)
 		}
 	}
-	prev := db.keys.Set(item)
+	prev := keys.Set(item)
 	if prev != nil {
 		// A previous item was removed from the keys tree. Let's
 		// fully delete this item from all indexes.
 		pdbi = prev.(*dbItem)
 		if pdbi.opts != nil && pdbi.opts.ex {
 			// Remove it from the expires tree.
-			db.exps.Delete(pdbi)
+			exps.Delete(pdbi)
 		}
-		for _, idx := range idxs {
+		for _, idx := range idxList {
 			if idx.btr != nil {
 				// Remove it from the btree index.
 				idx.btr.Delete(pdbi)
@@ -490,9 +708,9 @@ func (db *DB) insertIntoDatabase(item *dbItem) *dbItem {
 	if item.opts != nil && item.opts.ex {
 		// The new item has eviction options. Add it to the
 		// expires tree
-		db.exps.Set(item)
+		exps.Set(item)
 	}
-	for i, idx := range idxs {
+	for i, idx := range idxList {
 		if idx.btr != nil {
 			// Add new item to btree index.
 			idx.btr.Set(item)
@@ -502,30 +720,27 @@ func (db *DB) insertIntoDatabase(item *dbItem) *dbItem {
 			idx.rtr.Insert(item)
 		}
 		// clear the index
-		idxs[i] = nil
+		idxList[i] = nil
 	}
 	// reuse the index list slice
-	db.insIdxs = idxs[:0]
+	*insIdxs = idxList[:0]
 	// we must return the previous item to the caller.
 	return pdbi
 }
 
-// deleteFromDatabase removes and item from the database and indexes. The input
-// item must only have the key field specified thus "&dbItem{key: key}" is all
-// that is needed to fully remove the item with the matching key. If an item
-// with the matching key was found in the database, it will be removed and
-// returned to the caller. A nil return value means that the item was not
-// found in the database
-func (db *DB) deleteFromDatabase(item *dbItem) *dbItem {
+// deleteFromDatabase removes an item from the supplied trees and indexes.
+func deleteFromDatabase(keys, exps *btree.BTree, idxs map[string]*index,
+	item *dbItem,
+) *dbItem {
 	var pdbi *dbItem
-	prev := db.keys.Delete(item)
+	prev := keys.Delete(item)
 	if prev != nil {
 		pdbi = prev.(*dbItem)
 		if pdbi.opts != nil && pdbi.opts.ex {
 			// Remove it from the exipres tree.
-			db.exps.Delete(pdbi)
+			exps.Delete(pdbi)
 		}
-		for _, idx := range db.idxs {
+		for _, idx := range idxs {
 			if !idx.match(pdbi.key) {
 				continue
 			}
@@ -540,6 +755,17 @@ func (db *DB) deleteFromDatabase(item *dbItem) *dbItem {
 		}
 	}
 	return pdbi
+}
+
+// insertIntoDatabase performs inserts an item in to the database and updates
+// all indexes.
+func (db *DB) insertIntoDatabase(item *dbItem) *dbItem {
+	return insertIntoDatabase(db.keys, db.exps, db.idxs, &db.insIdxs, item)
+}
+
+// deleteFromDatabase removes an item from the database and indexes.
+func (db *DB) deleteFromDatabase(item *dbItem) *dbItem {
+	return deleteFromDatabase(db.keys, db.exps, db.idxs, item)
 }
 
 // backgroundManager runs continuously in the background and performs various
@@ -572,7 +798,7 @@ func (db *DB) backgroundManager() {
 				}
 			}
 			// produce a list of expired items that need removing
-			btreeAscendLessThan(db.exps, &dbItem{
+			btreeAscendLessThan(tx.state.exps, &dbItem{
 				opts: &dbItemOpts{ex: true, exat: time.Now()},
 			}, func(item interface{}) bool {
 				expired = append(expired, item.(*dbItem))
@@ -1019,8 +1245,14 @@ func (db *DB) load() error {
 // managed calls a block of code that is fully contained in a transaction.
 // This method is intended to be wrapped by Update and View
 func (db *DB) managed(writable bool, fn func(tx *Tx) error) (err error) {
+	return db.managedOptions(writable, nil, fn)
+}
+
+func (db *DB) managedOptions(writable bool, opts *TxOptions,
+	fn func(tx *Tx) error,
+) (err error) {
 	var tx *Tx
-	tx, err = db.Begin(writable)
+	tx, err = db.BeginWithOptions(writable, opts)
 	if err != nil {
 		return
 	}
@@ -1056,6 +1288,14 @@ func (db *DB) View(fn func(tx *Tx) error) error {
 	return db.managed(false, fn)
 }
 
+// ViewWithOptions executes a read-only transaction using the provided
+// isolation options. A read-only transaction never blocks a writer.
+func (db *DB) ViewWithOptions(opts *TxOptions,
+	fn func(tx *Tx) error,
+) error {
+	return db.managedOptions(false, opts, fn)
+}
+
 // Update executes a function within a managed read/write transaction.
 // The transaction has been committed when no error is returned.
 // In the event that an error is returned, the transaction will be rolled back.
@@ -1066,6 +1306,47 @@ func (db *DB) View(fn func(tx *Tx) error) error {
 // in a panic.
 func (db *DB) Update(fn func(tx *Tx) error) error {
 	return db.managed(true, fn)
+}
+
+// UpdateWithOptions executes a read/write transaction using the provided
+// isolation and conflict options. Writes are applied to the transaction's
+// private snapshot and published with a short lock at commit time.
+func (db *DB) UpdateWithOptions(opts *TxOptions,
+	fn func(tx *Tx) error,
+) error {
+	return db.managedOptions(true, opts, fn)
+}
+
+// ViewTx executes a read-only transaction with functional options.
+func (db *DB) ViewTx(fn func(tx *Tx) error, options ...TxOption) error {
+	opts := &TxOptions{}
+	for _, option := range options {
+		option(opts)
+	}
+	return db.managedOptions(false, opts, fn)
+}
+
+// UpdateTx executes a read/write transaction with functional options.
+func (db *DB) UpdateTx(fn func(tx *Tx) error, options ...TxOption) error {
+	opts := &TxOptions{}
+	for _, option := range options {
+		option(opts)
+	}
+	return db.managedOptions(true, opts, fn)
+}
+
+// ViewWithIsolation is a convenience wrapper around ViewWithOptions.
+func (db *DB) ViewWithIsolation(level IsolationLevel,
+	fn func(tx *Tx) error,
+) error {
+	return db.ViewWithOptions(&TxOptions{Isolation: level}, fn)
+}
+
+// UpdateWithIsolation is a convenience wrapper around UpdateWithOptions.
+func (db *DB) UpdateWithIsolation(level IsolationLevel,
+	fn func(tx *Tx) error,
+) error {
+	return db.UpdateWithOptions(&TxOptions{Isolation: level}, fn)
 }
 
 // get return an item or nil if not found.
@@ -1084,22 +1365,31 @@ func (db *DB) get(key string) *dbItem {
 //
 // All transactions must be committed or rolled-back when done.
 type Tx struct {
-	db       *DB             // the underlying database.
-	writable bool            // when false mutable operations fail.
-	funcd    bool            // when true Commit and Rollback panic.
-	wc       *txWriteContext // context for writable transactions.
+	db          *DB             // the underlying database.
+	origin      *DB             // db pointer retained for lock cleanup
+	writable    bool            // when false mutable operations fail.
+	funcd       bool            // when true Commit and Rollback panic.
+	wc          *txWriteContext // context for writable transactions.
+	state       *txState        // the transaction's stable data view.
+	baseVersion uint64          // the snapshot version this transaction began with
+	isolation   IsolationLevel
+	conflict    ConflictPolicy
+	serialized  bool // true when this writer holds db.writeMu
+}
+
+type txState struct {
+	keys    *btree.BTree
+	exps    *btree.BTree
+	idxs    map[string]*index
+	insIdxs []*index
 }
 
 type txWriteContext struct {
-	// rollback when deleteAll is called
-	rbkeys *btree.BTree      // a tree of all item ordered by key
-	rbexps *btree.BTree      // a tree of items ordered by expiration
-	rbidxs map[string]*index // the index trees.
-
-	rollbackItems   map[string]*dbItem // details for rolling back tx.
-	commitItems     map[string]*dbItem // details for committing tx.
-	itercount       int                // stack of iterators
-	rollbackIndexes map[string]*index  // details for dropped indexes.
+	changes     map[string]*dbItem // final value for each changed key; nil deletes
+	indexOps    map[string]*index  // final index state; nil means dropped
+	deleteAll   bool               // flushdb was requested
+	itercount   int                // stack of iterators
+	indexChange bool               // an index was created or dropped
 }
 
 // DeleteAll deletes all items from the database.
@@ -1112,26 +1402,22 @@ func (tx *Tx) DeleteAll() error {
 		return ErrTxIterating
 	}
 
-	// check to see if we've already deleted everything
-	if tx.wc.rbkeys == nil {
-		// we need to backup the live data in case of a rollback.
-		tx.wc.rbkeys = tx.db.keys
-		tx.wc.rbexps = tx.db.exps
-		tx.wc.rbidxs = tx.db.idxs
-	}
-
-	// now reset the live database trees
-	tx.db.keys = btreeNew(lessCtx(nil))
-	tx.db.exps = btreeNew(lessCtx(&exctx{tx.db}))
-	tx.db.idxs = make(map[string]*index)
+	oldIdxs := tx.state.idxs
+	// Reset the private trees. Other transactions continue to read their own
+	// snapshots while this transaction is being built.
+	tx.state.keys = btreeNew(lessCtx(nil))
+	tx.state.exps = btreeNew(lessCtx(&exctx{tx.db}))
+	tx.state.idxs = make(map[string]*index)
+	tx.state.insIdxs = nil
 
 	// finally re-create the indexes
-	for name, idx := range tx.wc.rbidxs {
-		tx.db.idxs[name] = idx.clearCopy()
+	for name, idx := range oldIdxs {
+		tx.state.idxs[name] = idx.clearCopy()
 	}
 
 	// always clear out the commits
-	tx.wc.commitItems = make(map[string]*dbItem)
+	tx.wc.changes = make(map[string]*dbItem)
+	tx.wc.deleteAll = true
 
 	return nil
 }
@@ -1144,73 +1430,242 @@ func (tx *Tx) DeleteAll() error {
 //
 // All transactions must be closed by calling Commit() or Rollback() when done.
 func (db *DB) Begin(writable bool) (*Tx, error) {
+	return db.BeginWithOptions(writable, nil)
+}
+
+// BeginWithOptions opens a transaction with explicit isolation and conflict
+// options. Read-only transactions take a stable snapshot without taking a lock
+// on the live key tree. Writable transactions modify a private copy-on-write
+// snapshot and publish it atomically at commit time.
+func (db *DB) BeginWithOptions(writable bool, opts *TxOptions) (*Tx, error) {
+	nopts := normalizeTxOptions(opts)
 	tx := &Tx{
-		db:       db,
-		writable: writable,
+		db:        db,
+		origin:    db,
+		writable:  writable,
+		isolation: nopts.Isolation,
+		conflict:  nopts.Conflict,
 	}
-	tx.lock()
+	if writable && tx.conflict == ConflictWait {
+		db.writeMu.Lock()
+		tx.serialized = true
+	}
+	db.mu.RLock()
 	if db.closed {
 		tx.unlock()
+		db.mu.RUnlock()
 		return nil, ErrDatabaseClosed
 	}
 	if writable {
-		// writable transactions have a writeContext object that
-		// contains information about changes to the database.
+		db.snapshotMu.Lock()
+		tx.baseVersion = db.version
+		tx.state = db.cloneStateLocked()
+		db.snapshotMu.Unlock()
 		tx.wc = &txWriteContext{}
-		tx.wc.rollbackItems = make(map[string]*dbItem)
-		tx.wc.rollbackIndexes = make(map[string]*index)
-		if db.persist {
-			tx.wc.commitItems = make(map[string]*dbItem)
-		}
+		tx.wc.changes = make(map[string]*dbItem)
+		tx.wc.indexOps = make(map[string]*index)
+	} else {
+		// Copy() is constant-time and copy-on-write, but it updates the
+		// source tree's COW token. Hold the write side of snapshotMu just
+		// long enough to create independent transaction trees.
+		db.snapshotMu.Lock()
+		tx.baseVersion = db.version
+		tx.state = db.readStateLocked()
+		db.snapshotMu.Unlock()
 	}
+	db.mu.RUnlock()
 	return tx, nil
 }
 
-// lock locks the database based on the transaction type.
-func (tx *Tx) lock() {
-	if tx.writable {
-		tx.db.mu.Lock()
-	} else {
-		tx.db.mu.RLock()
+// BeginTx opens a transaction using functional options.
+func (db *DB) BeginTx(writable bool, options ...TxOption) (*Tx, error) {
+	opts := &TxOptions{}
+	for _, option := range options {
+		option(opts)
 	}
+	return db.BeginWithOptions(writable, opts)
 }
 
-// unlock unlocks the database based on the transaction type.
+// IsolationLevel returns the transaction's isolation level.
+func (tx *Tx) IsolationLevel() IsolationLevel {
+	return tx.isolation
+}
+
+// ConflictPolicy returns the transaction's conflict policy.
+func (tx *Tx) ConflictPolicy() ConflictPolicy {
+	return tx.conflict
+}
+
+// unlock releases any writer serialization slot held by the transaction.
 func (tx *Tx) unlock() {
-	if tx.writable {
-		tx.db.mu.Unlock()
-	} else {
-		tx.db.mu.RUnlock()
+	if tx.serialized {
+		tx.origin.writeMu.Unlock()
+		tx.serialized = false
 	}
 }
 
-// rollbackInner handles the underlying rollback logic.
-// Intended to be called from Commit() and Rollback().
-func (tx *Tx) rollbackInner() {
-	// rollback the deleteAll if needed
-	if tx.wc.rbkeys != nil {
-		tx.db.keys = tx.wc.rbkeys
-		tx.db.idxs = tx.wc.rbidxs
-		tx.db.exps = tx.wc.rbexps
+// refresh advances a ReadCommitted read-only transaction to the latest
+// committed snapshot.
+func (tx *Tx) refresh() {
+	if tx.writable {
+		return
 	}
-	for key, item := range tx.wc.rollbackItems {
-		tx.db.deleteFromDatabase(&dbItem{key: key})
+	if tx.isolation != ReadCommitted && tx.isolation != ReadUncommitted {
+		return
+	}
+	db := tx.db
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return
+	}
+	db.snapshotMu.Lock()
+	tx.state = db.readStateLocked()
+	tx.baseVersion = db.version
+	db.snapshotMu.Unlock()
+}
+
+func (tx *Tx) get(key string) *dbItem {
+	item := tx.state.keys.Get(&dbItem{key: key})
+	if item != nil {
+		return item.(*dbItem)
+	}
+	return nil
+}
+
+func copyIndexForWrite(idx *index, keys *btree.BTree) *index {
+	nidx := &index{
+		name:    idx.name,
+		pattern: idx.pattern,
+		db:      idx.db,
+		less:    idx.less,
+		rect:    idx.rect,
+		opts:    idx.opts,
+	}
+	if idx.btr != nil {
+		nidx.btr = idx.btr.Copy()
+	}
+	if idx.rtr != nil {
+		nidx.rtr = rtred.New(nidx)
+		btreeAscend(keys, func(item interface{}) bool {
+			dbi := item.(*dbItem)
+			if nidx.match(dbi.key) {
+				nidx.rtr.Insert(dbi)
+			}
+			return true
+		})
+	}
+	return nidx
+}
+
+func copyIndexForRead(idx *index) *index {
+	nidx := &index{
+		name:    idx.name,
+		pattern: idx.pattern,
+		db:      idx.db,
+		less:    idx.less,
+		rect:    idx.rect,
+		opts:    idx.opts,
+	}
+	if idx.btr != nil {
+		nidx.btr = idx.btr.Copy()
+	}
+	// Published R-trees are never mutated: writers replace them with freshly
+	// built trees at commit time. Sharing is therefore a stable snapshot and
+	// avoids copying a spatial index for every report.
+	nidx.rtr = idx.rtr
+	return nidx
+}
+
+func (db *DB) readStateLocked() *txState {
+	state := &txState{
+		keys: db.keys.Copy(),
+		exps: db.exps.Copy(),
+		idxs: make(map[string]*index, len(db.idxs)),
+	}
+	for name, idx := range db.idxs {
+		state.idxs[name] = copyIndexForRead(idx)
+	}
+	return state
+}
+
+func (db *DB) cloneStateLocked() *txState {
+	state := &txState{
+		keys: db.keys.Copy(),
+		exps: db.exps.Copy(),
+		idxs: make(map[string]*index, len(db.idxs)),
+	}
+	for name, idx := range db.idxs {
+		state.idxs[name] = copyIndexForWrite(idx, state.keys)
+	}
+	return state
+}
+
+// rebaseWriteSetLocked applies this transaction's logical changes to the
+// latest committed snapshot. Other writers' changes to untouched keys remain
+// visible.
+func (tx *Tx) rebaseWriteSetLocked() *txState {
+	state := tx.db.cloneStateLocked()
+	for name, template := range tx.wc.indexOps {
+		if template == nil {
+			delete(state.idxs, name)
+			continue
+		}
+		// The template contains this transaction's stale trees. Rebuild an
+		// empty index with the same definition from the latest keyspace so
+		// committed changes from the conflicting writer are not lost.
+		idx := template.clearCopy()
+		idx.rebuild(state.keys)
+		state.idxs[name] = idx
+	}
+	for key, item := range tx.wc.changes {
+		deleteFromDatabase(state.keys, state.exps, state.idxs,
+			&dbItem{key: key})
 		if item != nil {
-			// When an item is not nil, we will need to reinsert that item
-			// into the database overwriting the current one.
-			tx.db.insertIntoDatabase(item)
+			insertIntoDatabase(state.keys, state.exps, state.idxs,
+				&state.insIdxs, item)
 		}
 	}
-	for name, idx := range tx.wc.rollbackIndexes {
-		delete(tx.db.idxs, name)
-		if idx != nil {
-			// When an index is not nil, we will need to rebuilt that index
-			// this could be an expensive process if the database has many
-			// items or the index is complex.
-			tx.db.idxs[name] = idx
-			idx.rebuild()
+	return state
+}
+
+func (tx *Tx) writeAOF() error {
+	db := tx.db
+	if !db.persist || (!tx.wc.deleteAll && len(tx.wc.changes) == 0) {
+		return nil
+	}
+	db.buf = db.buf[:0]
+	if tx.wc.deleteAll {
+		db.buf = append(db.buf, "*1\r\n$7\r\nflushdb\r\n"...)
+	}
+	now := time.Now()
+	for key, item := range tx.wc.changes {
+		if item == nil {
+			db.buf = (&dbItem{key: key}).writeDeleteTo(db.buf)
+		} else {
+			db.buf = item.writeSetTo(db.buf, now)
 		}
 	}
+	n, err := db.file.Write(db.buf)
+	if err != nil {
+		if n > 0 {
+			// There was a partial write to disk. Remove the tail so that a
+			// later load does not observe a half-written command.
+			pos, seekErr := db.file.Seek(-int64(n), 1)
+			if seekErr != nil {
+				panicErr(seekErr)
+			}
+			if truncErr := db.file.Truncate(pos); truncErr != nil {
+				panicErr(truncErr)
+			}
+		}
+		return err
+	}
+	if db.config.SyncPolicy == Always {
+		_ = db.file.Sync()
+	}
+	db.flushes++
+	return nil
 }
 
 // Commit writes all changes to disk.
@@ -1221,61 +1676,63 @@ func (tx *Tx) Commit() error {
 		panic("managed tx commit not allowed")
 	}
 	if tx.db == nil {
+		tx.unlock()
 		return ErrTxClosed
 	} else if !tx.writable {
+		tx.unlock()
 		return ErrTxNotWritable
 	}
-	var err error
-	if tx.db.persist && (len(tx.wc.commitItems) > 0 || tx.wc.rbkeys != nil) {
-		tx.db.buf = tx.db.buf[:0]
-		// write a flushdb if a deleteAll was called.
-		if tx.wc.rbkeys != nil {
-			tx.db.buf = append(tx.db.buf, "*1\r\n$7\r\nflushdb\r\n"...)
-		}
-		now := time.Now()
-		// Each committed record is written to disk
-		for key, item := range tx.wc.commitItems {
-			if item == nil {
-				tx.db.buf = (&dbItem{key: key}).writeDeleteTo(tx.db.buf)
-			} else {
-				tx.db.buf = item.writeSetTo(tx.db.buf, now)
-			}
-		}
-		// Flushing the buffer only once per transaction.
-		// If this operation fails then the write did failed and we must
-		// rollback.
-		var n int
-		n, err = tx.db.file.Write(tx.db.buf)
-		if err != nil {
-			if n > 0 {
-				// There was a partial write to disk.
-				// We are possibly out of disk space.
-				// Delete the partially written bytes from the data file by
-				// seeking to the previously known position and performing
-				// a truncate operation.
-				// At this point a syscall failure is fatal and the process
-				// should be killed to avoid corrupting the file.
-				pos, err := tx.db.file.Seek(-int64(n), 1)
-				if err != nil {
-					panicErr(err)
-				}
-				if err := tx.db.file.Truncate(pos); err != nil {
-					panicErr(err)
-				}
-			}
-			tx.rollbackInner()
-		}
-		if tx.db.config.SyncPolicy == Always {
-			_ = tx.db.file.Sync()
-		}
-		// Increment the number of flushes. The background syncing uses this.
-		tx.db.flushes++
+	db := tx.db
+	db.mu.Lock()
+	if db.closed {
+		db.mu.Unlock()
+		tx.unlock()
+		tx.db = nil
+		return ErrDatabaseClosed
 	}
-	// Unlock the database and allow for another writable transaction.
+
+	changed := tx.wc.deleteAll || len(tx.wc.changes) > 0 ||
+		tx.wc.indexChange
+	if !changed {
+		db.mu.Unlock()
+		tx.unlock()
+		tx.db = nil
+		return nil
+	}
+
+	db.snapshotMu.Lock()
+	conflict := tx.baseVersion != db.version
+	if conflict && tx.conflict == ConflictAbort {
+		db.snapshotMu.Unlock()
+		db.mu.Unlock()
+		tx.unlock()
+		tx.db = nil
+		return ErrTxConflict
+	}
+	publish := tx.state
+	if conflict && !tx.wc.deleteAll &&
+		(tx.conflict == ConflictOverwrite || tx.conflict == ConflictWait) {
+		publish = tx.rebaseWriteSetLocked()
+	}
+	db.snapshotMu.Unlock()
+
+	if err := tx.writeAOF(); err != nil {
+		db.mu.Unlock()
+		tx.unlock()
+		tx.db = nil
+		return err
+	}
+
+	db.snapshotMu.Lock()
+	db.keys = publish.keys
+	db.exps = publish.exps
+	db.idxs = publish.idxs
+	db.version++
+	db.snapshotMu.Unlock()
+	db.mu.Unlock()
 	tx.unlock()
-	// Clear the db field to disable this transaction from future use.
 	tx.db = nil
-	return err
+	return nil
 }
 
 // Rollback closes the transaction and reverts all mutable operations that
@@ -1287,11 +1744,8 @@ func (tx *Tx) Rollback() error {
 		panic("managed tx rollback not allowed")
 	}
 	if tx.db == nil {
+		tx.unlock()
 		return ErrTxClosed
-	}
-	// The rollback func does the heavy lifting.
-	if tx.writable {
-		tx.rollbackInner()
 	}
 	// unlock the database for more transactions.
 	tx.unlock()
@@ -1492,7 +1946,8 @@ func (tx *Tx) GetLess(index string) (func(a, b string) bool, error) {
 	if tx.db == nil {
 		return nil, ErrTxClosed
 	}
-	idx, ok := tx.db.idxs[index]
+	tx.refresh()
+	idx, ok := tx.state.idxs[index]
 	if !ok || idx.less == nil {
 		return nil, ErrNotFound
 	}
@@ -1508,7 +1963,8 @@ func (tx *Tx) GetRect(index string) (func(s string) (min, max []float64),
 	if tx.db == nil {
 		return nil, ErrTxClosed
 	}
-	idx, ok := tx.db.idxs[index]
+	tx.refresh()
+	idx, ok := tx.state.idxs[index]
 	if !ok || idx.rect == nil {
 		return nil, ErrNotFound
 	}
@@ -1543,37 +1999,12 @@ func (tx *Tx) Set(key, value string, opts *SetOptions) (previousValue string,
 			item.opts = &dbItemOpts{ex: true, exat: time.Now().Add(opts.TTL)}
 		}
 	}
-	// Insert the item into the keys tree.
-	prev := tx.db.insertIntoDatabase(item)
-
-	// insert into the rollback map if there has not been a deleteAll.
-	if tx.wc.rbkeys == nil {
-		if prev == nil {
-			// An item with the same key did not previously exist. Let's
-			// create a rollback entry with a nil value. A nil value indicates
-			// that the entry should be deleted on rollback. When the value is
-			// *not* nil, that means the entry should be reverted.
-			if _, ok := tx.wc.rollbackItems[key]; !ok {
-				tx.wc.rollbackItems[key] = nil
-			}
-		} else {
-			// A previous item already exists in the database. Let's create a
-			// rollback entry with the item as the value. We need to check the
-			// map to see if there isn't already an item that matches the
-			// same key.
-			if _, ok := tx.wc.rollbackItems[key]; !ok {
-				tx.wc.rollbackItems[key] = prev
-			}
-			if !prev.expired() {
-				previousValue, replaced = prev.val, true
-			}
-		}
+	prev := insertIntoDatabase(tx.state.keys, tx.state.exps, tx.state.idxs,
+		&tx.state.insIdxs, item)
+	if prev != nil && !prev.expired() {
+		previousValue, replaced = prev.val, true
 	}
-	// For commits we simply assign the item to the map. We use this map to
-	// write the entry to disk.
-	if tx.db.persist {
-		tx.wc.commitItems[key] = item
-	}
+	tx.wc.changes[key] = item
 	return previousValue, replaced, nil
 }
 
@@ -1584,11 +2015,12 @@ func (tx *Tx) Get(key string, ignoreExpired ...bool) (val string, err error) {
 	if tx.db == nil {
 		return "", ErrTxClosed
 	}
+	tx.refresh()
 	var ignore bool
 	if len(ignoreExpired) != 0 {
 		ignore = ignoreExpired[0]
 	}
-	item := tx.db.get(key)
+	item := tx.get(key)
 	if item == nil || (item.expired() && !ignore) {
 		// The item does not exists or has expired. Let's assume that
 		// the caller is only interested in items that have not expired.
@@ -1610,19 +2042,12 @@ func (tx *Tx) Delete(key string) (val string, err error) {
 	} else if tx.wc.itercount > 0 {
 		return "", ErrTxIterating
 	}
-	item := tx.db.deleteFromDatabase(&dbItem{key: key})
+	item := deleteFromDatabase(tx.state.keys, tx.state.exps, tx.state.idxs,
+		&dbItem{key: key})
 	if item == nil {
 		return "", ErrNotFound
 	}
-	// create a rollback entry if there has not been a deleteAll call.
-	if tx.wc.rbkeys == nil {
-		if _, ok := tx.wc.rollbackItems[key]; !ok {
-			tx.wc.rollbackItems[key] = item
-		}
-	}
-	if tx.db.persist {
-		tx.wc.commitItems[key] = nil
-	}
+	tx.wc.changes[key] = nil
 	// Even though the item has been deleted, we still want to check
 	// if it has expired. An expired item should not be returned.
 	if item.expired() {
@@ -1640,7 +2065,8 @@ func (tx *Tx) TTL(key string) (time.Duration, error) {
 	if tx.db == nil {
 		return 0, ErrTxClosed
 	}
-	item := tx.db.get(key)
+	tx.refresh()
+	item := tx.get(key)
 	if item == nil {
 		return 0, ErrNotFound
 	} else if item.opts == nil || !item.opts.ex {
@@ -1668,6 +2094,7 @@ func (tx *Tx) scan(desc, gt, lt bool, index, start, stop string,
 	if tx.db == nil {
 		return ErrTxClosed
 	}
+	tx.refresh()
 	// wrap a btree specific iterator around the user-defined iterator.
 	iter := func(item interface{}) bool {
 		dbi := item.(*dbItem)
@@ -1679,9 +2106,9 @@ func (tx *Tx) scan(desc, gt, lt bool, index, start, stop string,
 	var tr *btree.BTree
 	if index == "" {
 		// empty index means we will use the keys tree.
-		tr = tx.db.keys
+		tr = tx.state.keys
 	} else {
-		idx := tx.db.idxs[index]
+		idx := tx.state.idxs[index]
 		if idx == nil {
 			// index was not found. return error
 			return ErrNotFound
@@ -1994,7 +2421,8 @@ func (tx *Tx) Nearby(index, bounds string,
 		dbi := item.(*dbItem)
 		return iterator(dbi.key, dbi.val, dist)
 	}
-	idx := tx.db.idxs[index]
+	tx.refresh()
+	idx := tx.state.idxs[index]
 	if idx == nil {
 		// index was not found. return error
 		return ErrNotFound
@@ -2032,7 +2460,8 @@ func (tx *Tx) Intersects(index, bounds string,
 		dbi := item.(*dbItem)
 		return iterator(dbi.key, dbi.val)
 	}
-	idx := tx.db.idxs[index]
+	tx.refresh()
+	idx := tx.state.idxs[index]
 	if idx == nil {
 		// index was not found. return error
 		return ErrNotFound
@@ -2055,7 +2484,8 @@ func (tx *Tx) Len() (int, error) {
 	if tx.db == nil {
 		return 0, ErrTxClosed
 	}
-	return tx.db.keys.Len(), nil
+	tx.refresh()
+	return tx.state.keys.Len(), nil
 }
 
 // IndexOptions provides an index with additional features or
@@ -2140,7 +2570,7 @@ func (tx *Tx) createIndex(name string, pattern string,
 		return ErrIndexExists
 	}
 	// check if an index with that name already exists.
-	if _, ok := tx.db.idxs[name]; ok {
+	if _, ok := tx.state.idxs[name]; ok {
 		// index with name already exists. error.
 		return ErrIndexExists
 	}
@@ -2182,17 +2612,11 @@ func (tx *Tx) createIndex(name string, pattern string,
 		db:      tx.db,
 		opts:    sopts,
 	}
-	idx.rebuild()
+	idx.rebuild(tx.state.keys)
 	// save the index
-	tx.db.idxs[name] = idx
-	if tx.wc.rbkeys == nil {
-		// store the index in the rollback map.
-		if _, ok := tx.wc.rollbackIndexes[name]; !ok {
-			// we use nil to indicate that the index should be removed upon
-			// rollback.
-			tx.wc.rollbackIndexes[name] = nil
-		}
-	}
+	tx.state.idxs[name] = idx
+	tx.wc.indexOps[name] = idx
+	tx.wc.indexChange = true
 	return nil
 }
 
@@ -2209,21 +2633,16 @@ func (tx *Tx) DropIndex(name string) error {
 		// cannot drop the default "keys" index
 		return ErrInvalidOperation
 	}
-	idx, ok := tx.db.idxs[name]
+	idx, ok := tx.state.idxs[name]
 	if !ok {
 		return ErrNotFound
 	}
 	// delete from the map.
 	// this is all that is needed to delete an index.
-	delete(tx.db.idxs, name)
-	if tx.wc.rbkeys == nil {
-		// store the index in the rollback map.
-		if _, ok := tx.wc.rollbackIndexes[name]; !ok {
-			// we use a non-nil copy of the index without the data to indicate
-			// that the index should be rebuilt upon rollback.
-			tx.wc.rollbackIndexes[name] = idx.clearCopy()
-		}
-	}
+	_ = idx
+	delete(tx.state.idxs, name)
+	tx.wc.indexOps[name] = nil
+	tx.wc.indexChange = true
 	return nil
 }
 
@@ -2232,8 +2651,9 @@ func (tx *Tx) Indexes() ([]string, error) {
 	if tx.db == nil {
 		return nil, ErrTxClosed
 	}
-	names := make([]string, 0, len(tx.db.idxs))
-	for name := range tx.db.idxs {
+	tx.refresh()
+	names := make([]string, 0, len(tx.state.idxs))
+	for name := range tx.state.idxs {
 		names = append(names, name)
 	}
 	sort.Strings(names)

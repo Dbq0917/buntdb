@@ -759,7 +759,6 @@ func TestVariousTx(t *testing.T) {
 	}); err != ErrTxClosed {
 		t.Fatal("expecting tx closed error")
 	}
-	db.mu.Unlock()
 
 	// test for invalid writes
 	if err := db.Update(func(tx *Tx) error {
@@ -768,7 +767,6 @@ func TestVariousTx(t *testing.T) {
 	}); err != ErrTxNotWritable {
 		t.Fatal("expecting tx not writable error")
 	}
-	db.mu.Unlock()
 	// test for closed transactions
 	if err := db.View(func(tx *Tx) error {
 		tx.db = nil
@@ -776,7 +774,6 @@ func TestVariousTx(t *testing.T) {
 	}); err != ErrTxClosed {
 		t.Fatal("expecting tx closed error")
 	}
-	db.mu.RUnlock()
 	// flush to unwritable file
 	if err := db.Update(func(tx *Tx) error {
 		_, _, err := tx.Set("var1", "val1", nil)

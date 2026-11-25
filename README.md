@@ -94,13 +94,94 @@ err := db.View(func(tx *buntdb.Tx) error {
 ```
 
 ### Read/write Transactions
-A read/write transaction is used when you need to make changes to your data. There can only be one read/write transaction running at a time. So make sure you close it as soon as you are done with it.
+A read/write transaction is used when you need to make changes to your data. By default, `buntdb.ConflictWait` allows only one read/write transaction at a time. So make sure you close it as soon as you are done with it. Optimistic conflict policies are described below.
 
 ```go
 err := db.Update(func(tx *buntdb.Tx) error {
 	...
 	return nil
 })
+```
+
+### Isolation and snapshots
+
+`View` and the default `Begin(false)` use repeatable-read snapshot isolation.
+The snapshot is created with the B-tree's constant-time copy-on-write `Copy`
+operation; BuntDB does not duplicate the whole keyspace. A report can therefore
+scan the database for as long as it needs while other transactions continue to
+write. The reader keeps seeing the same version of every key for the whole
+transaction.
+
+Use `ViewWithIsolation` or `ViewWithOptions` to choose a level:
+
+```go
+// RepeatableRead (also named SnapshotIsolation) pins one consistent view.
+err := db.ViewWithIsolation(buntdb.RepeatableRead, func(tx *buntdb.Tx) error {
+	first, err := tx.Get("hot")
+	if err != nil {
+		return err
+	}
+
+	// This full scan and the final Get observe the same snapshot, even while
+	// another goroutine repeatedly commits a new value for "hot".
+	if err := tx.Ascend("", func(key, value string) bool {
+		return true
+	}); err != nil {
+		return err
+	}
+
+	last, err := tx.Get("hot")
+	if err != nil {
+		return err
+	}
+	if first != last {
+		return fmt.Errorf("snapshot changed: %q != %q", first, last)
+	}
+	return nil
+})
+
+// ReadCommitted refreshes before each statement and may see new commits.
+err = db.ViewWithOptions(&buntdb.TxOptions{
+	Isolation: buntdb.ReadCommitted,
+}, func(tx *buntdb.Tx) error {
+	return nil
+})
+```
+
+Writable transactions also modify private copy-on-write trees and publish them
+atomically at commit. The default `buntdb.ConflictWait` policy keeps the
+historical single-writer behavior. Optimistic transactions can choose what to
+do when another transaction commits after their snapshot:
+
+- `buntdb.ConflictAbort` returns `buntdb.ErrTxConflict` (also aliased as
+  `buntdb.ErrConflict` and `buntdb.ErrSerializationFailure`).
+- `buntdb.ConflictOverwrite` rebases the transaction's writes onto the latest
+  committed state; its values win for keys it wrote.
+- `buntdb.ConflictWait` serializes writers and, if an optimistic transaction
+  still advanced the database version, rebases at commit time.
+
+```go
+err := db.UpdateWithOptions(&buntdb.TxOptions{
+	Isolation: buntdb.SerializableIsolation,
+	Conflict:  buntdb.ConflictAbort,
+}, func(tx *buntdb.Tx) error {
+	_, _, err := tx.Set("order:1", "committing", nil)
+	return err
+})
+if errors.Is(err, buntdb.ErrTxConflict) {
+	// Retry the transaction against a fresh snapshot.
+}
+```
+
+Functional options are also available as `db.ViewTx`, `db.UpdateTx`, and
+`db.BeginTx`:
+
+```go
+err := db.UpdateTx(func(tx *buntdb.Tx) error {
+	_, _, err := tx.Set("hot", "next", nil)
+	return err
+}, buntdb.WithIsolation(buntdb.SnapshotIsolation),
+	buntdb.WithConflict(buntdb.ConflictOverwrite))
 ```
 
 ## Setting and getting key/values

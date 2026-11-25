@@ -68,6 +68,7 @@ const useAbsEx = true
 // Transactions are used for all forms of data access to the DB.
 type DB struct {
 	mu        sync.RWMutex      // the gatekeeper for all fields
+	saveMu    sync.Mutex        // serializes point-in-time tree copies
 	file      *os.File          // the underlying file
 	buf       []byte            // a buffer to write to
 	keys      *btree.BTree      // a tree of all item ordered by key
@@ -195,19 +196,32 @@ func (db *DB) Close() error {
 	return nil
 }
 
-// Save writes a snapshot of the database to a writer. This operation blocks all
-// writes, but not reads. This can be used for snapshots and backups for pure
-// in-memory databases using the ":memory:". Database that persist to disk
-// can be snapshotted by simply copying the database file.
+// Save writes a point-in-time snapshot of the database to a writer. The
+// database lock is only held while creating a copy-on-write view of the key
+// tree; writes can continue while the snapshot is being serialized. This can
+// be used for snapshots and backups for pure in-memory databases using the
+// ":memory:". Databases that persist to disk can also be snapshotted by
+// copying the database file.
 func (db *DB) Save(wr io.Writer) error {
-	var err error
+	// BTree.Copy updates the source tree's copy-on-write token. Serialize
+	// those updates while the database read lock protects against writers.
+	db.saveMu.Lock()
 	db.mu.RLock()
-	defer db.mu.RUnlock()
+	if db.closed {
+		db.mu.RUnlock()
+		db.saveMu.Unlock()
+		return ErrDatabaseClosed
+	}
+	snapshot := db.keys.Copy()
+	now := time.Now()
+	db.mu.RUnlock()
+	db.saveMu.Unlock()
+
+	var err error
 	// use a buffered writer and flush every 4MB
 	var buf []byte
-	now := time.Now()
 	// iterated through every item in the database and write to the buffer
-	btreeAscend(db.keys, func(item interface{}) bool {
+	btreeAscend(snapshot, func(item interface{}) bool {
 		dbi := item.(*dbItem)
 		buf = dbi.writeSetTo(buf, now)
 		if len(buf) > 1024*1024*4 {

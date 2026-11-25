@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -2957,4 +2958,291 @@ func TestIssue112(t *testing.T) {
 		})
 		return err
 	})
+}
+
+func TestSavepointRollback(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("initial", "value", nil)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	failErr := errors.New("second segment failed")
+	if err := db.Update(func(tx *Tx) error {
+		if _, _, err := tx.Set("first", "one", nil); err != nil {
+			return err
+		}
+		first, err := tx.Savepoint()
+		if err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("second", "two", nil); err != nil {
+			return err
+		}
+		second, err := tx.Savepoint("second")
+		if err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("third", "three", nil); err != nil {
+			return err
+		}
+		if _, err := tx.Delete("initial"); err != nil {
+			return err
+		}
+		if err := tx.RollbackToSavepoint(second); err != nil {
+			return err
+		}
+		if _, err := tx.Get("third"); err != ErrNotFound {
+			return fmt.Errorf("expected third to be rolled back, got %v", err)
+		}
+		if _, err := tx.Get("initial"); err != nil {
+			return fmt.Errorf("expected delete to be rolled back: %v", err)
+		}
+		if err := tx.RollbackToSavepoint(first); err != nil {
+			return err
+		}
+		if _, err := tx.Get("second"); err != ErrNotFound {
+			return fmt.Errorf("expected second to be rolled back, got %v", err)
+		}
+		if val, err := tx.Get("first"); err != nil || val != "one" {
+			return fmt.Errorf("expected first to remain, got %q, %v", val, err)
+		}
+		if _, _, err := tx.Set("after", "rollback", nil); err != nil {
+			return err
+		}
+		return failErr
+	}); err != failErr {
+		t.Fatalf("expected %v, got %v", failErr, err)
+	}
+
+	if err := db.View(func(tx *Tx) error {
+		for _, key := range []string{"first", "second", "third", "after"} {
+			if _, err := tx.Get(key); err != ErrNotFound {
+				return fmt.Errorf("expected %s to be rolled back, got %v", key, err)
+			}
+		}
+		val, err := tx.Get("initial")
+		if err != nil {
+			return err
+		}
+		if val != "value" {
+			t.Fatalf("expected initial value to survive, got %q", val)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSavepointNested(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+
+	if err := db.Update(func(tx *Tx) error {
+		outer, err := tx.Savepoint()
+		if err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("outer", "value", nil); err != nil {
+			return err
+		}
+		inner, err := tx.Savepoint()
+		if err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("inner", "value", nil); err != nil {
+			return err
+		}
+		if err := tx.RollbackToSavepoint(inner); err != nil {
+			return err
+		}
+		if _, err := tx.Get("outer"); err != nil {
+			return fmt.Errorf("inner rollback removed outer work: %v", err)
+		}
+		if _, err := tx.Get("inner"); err != ErrNotFound {
+			return fmt.Errorf("expected inner work to be rolled back, got %v", err)
+		}
+		if _, _, err := tx.Set("inner", "retry", nil); err != nil {
+			return err
+		}
+		if err := tx.RollbackToSavepoint(outer); err != nil {
+			return err
+		}
+		if _, err := tx.Get("outer"); err != ErrNotFound {
+			return fmt.Errorf("expected outer work to be rolled back, got %v", err)
+		}
+		if _, err := tx.Get("inner"); err != ErrNotFound {
+			return fmt.Errorf("expected retry to be rolled back, got %v", err)
+		}
+		if _, _, err := tx.Set("final", "value", nil); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.View(func(tx *Tx) error {
+		if _, err := tx.Get("outer"); err != ErrNotFound {
+			return fmt.Errorf("expected outer to be absent, got %v", err)
+		}
+		if _, err := tx.Get("inner"); err != ErrNotFound {
+			return fmt.Errorf("expected inner to be absent, got %v", err)
+		}
+		val, err := tx.Get("final")
+		if err != nil {
+			return err
+		}
+		if val != "value" {
+			t.Fatalf("expected final value, got %q", val)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSavepointDoesNotCopyKeyspace(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+
+	if err := db.Update(func(tx *Tx) error {
+		keys := tx.db.keys
+		indexes := tx.db.idxs
+		for i := 0; i < 100; i++ {
+			if _, err := tx.Savepoint(); err != nil {
+				return err
+			}
+		}
+		if tx.db.keys != keys {
+			t.Fatal("savepoint copied the keyspace")
+		}
+		if len(tx.db.idxs) != len(indexes) {
+			t.Fatal("savepoint copied the index map")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSavepointDeleteAllAndIndex(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+
+	if err := db.Update(func(tx *Tx) error {
+		if _, _, err := tx.Set("a", "3", nil); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("b", "1", nil); err != nil {
+			return err
+		}
+		return tx.CreateIndex("numbers", "*", IndexInt)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Update(func(tx *Tx) error {
+		sp, err := tx.Savepoint()
+		if err != nil {
+			return err
+		}
+		if err := tx.DropIndex("numbers"); err != nil {
+			return err
+		}
+		if err := tx.DeleteAll(); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("c", "2", nil); err != nil {
+			return err
+		}
+		if err := tx.RollbackToSavepoint(sp); err != nil {
+			return err
+		}
+		if val, err := tx.Get("a"); err != nil || val != "3" {
+			return fmt.Errorf("expected a to be restored, got %q, %v", val, err)
+		}
+		if _, err := tx.Get("c"); err != ErrNotFound {
+			return fmt.Errorf("expected c to be rolled back, got %v", err)
+		}
+		return tx.Ascend("numbers", func(key, value string) bool {
+			if key == "a" {
+				return false
+			}
+			return true
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.View(func(tx *Tx) error {
+		return tx.Ascend("numbers", func(key, value string) bool {
+			return true
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSavepointPersistence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "savepoint.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = db.Close()
+	}()
+
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("key", "original", nil)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		if _, _, err := tx.Set("key", "kept", nil); err != nil {
+			return err
+		}
+		sp, err := tx.Savepoint()
+		if err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("key", "discarded", nil); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("temp", "discarded", nil); err != nil {
+			return err
+		}
+		return tx.RollbackToSavepoint(sp)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.View(func(tx *Tx) error {
+		val, err := tx.Get("key")
+		if err != nil {
+			return err
+		}
+		if val != "kept" {
+			t.Fatalf("expected kept value to be persisted, got %q", val)
+		}
+		if _, err := tx.Get("temp"); err != ErrNotFound {
+			return fmt.Errorf("expected temp to be absent, got %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 }

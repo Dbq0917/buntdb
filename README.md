@@ -83,6 +83,41 @@ Transactions run in a function that exposes a `Tx` object, which represents the 
 
 When a transaction fails, it will roll back, and revert all changes that occurred to the database during that transaction. There's a single return value that you can use to close the transaction. For read/write transactions, returning an error this way will force the transaction to roll back. When a read/write transaction succeeds all changes are persisted to disk.
 
+### Savepoints
+A read/write transaction can create savepoints so that a later failure only
+reverts the work done after that point. The transaction remains open after a
+rollback to a savepoint, and earlier changes are kept. Savepoints can be
+nested; rolling back to an inner savepoint leaves outer work intact, and
+rolling back to an outer savepoint also discards inner savepoints and their
+changes.
+
+```go
+err := db.Update(func(tx *buntdb.Tx) error {
+	if _, _, err := tx.Set("order:1", "prepared", nil); err != nil {
+		return err
+	}
+	savepoint, err := tx.Savepoint()
+	if err != nil {
+		return err
+	}
+
+	if _, _, err := tx.Set("order:1", "failed", nil); err != nil {
+		return err
+	}
+	if err := tx.RollbackToSavepoint(savepoint); err != nil {
+		return err
+	}
+
+	// "order:1" is "prepared" again, and the transaction can keep working.
+	_, _, err = tx.Set("order:1", "complete", nil)
+	return err
+})
+```
+
+Creating a savepoint records only the current transaction change-log
+position. It does not copy the keyspace. Rolling back replays only the
+changes made after that position.
+
 ### Read-only Transactions
 A read-only transaction should be used when you don't need to make changes to the data. The advantage of a read-only transaction is that there can be many running concurrently.
 

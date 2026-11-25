@@ -60,6 +60,10 @@ var (
 
 	// ErrTxIterating is returned when Set or Delete are called while iterating.
 	ErrTxIterating = errors.New("tx is iterating")
+
+	// ErrSavepointNotFound is returned when a savepoint does not exist in the
+	// current transaction.
+	ErrSavepointNotFound = errors.New("savepoint not found")
 )
 
 const useAbsEx = true
@@ -1090,16 +1094,44 @@ type Tx struct {
 	wc       *txWriteContext // context for writable transactions.
 }
 
-type txWriteContext struct {
-	// rollback when deleteAll is called
-	rbkeys *btree.BTree      // a tree of all item ordered by key
-	rbexps *btree.BTree      // a tree of items ordered by expiration
-	rbidxs map[string]*index // the index trees.
+// Savepoint identifies a savepoint created within a transaction.
+type Savepoint = int
 
-	rollbackItems   map[string]*dbItem // details for rolling back tx.
-	commitItems     map[string]*dbItem // details for committing tx.
-	itercount       int                // stack of iterators
-	rollbackIndexes map[string]*index  // details for dropped indexes.
+type savepoint struct {
+	id       Savepoint
+	name     string
+	position int
+}
+
+type txUndoKind uint8
+
+const (
+	txUndoItem txUndoKind = iota
+	txUndoIndex
+	txUndoDeleteAll
+)
+
+type txUndoEntry struct {
+	kind          txUndoKind
+	key           string
+	item          *dbItem
+	index         *index
+	commitItem    *dbItem
+	commitPresent bool
+	keys          *btree.BTree
+	exps          *btree.BTree
+	indexes       map[string]*index
+	commitItems   map[string]*dbItem
+	deleteAll     bool
+}
+
+type txWriteContext struct {
+	commitItems map[string]*dbItem // details for committing tx.
+	itercount   int                // stack of iterators
+	undo        []txUndoEntry      // append-only log of prior transaction state.
+	savepoints  []*savepoint       // active savepoints, oldest first.
+	nextID      Savepoint          // next savepoint identifier.
+	deleteAll   bool               // whether the current state includes a deleteAll.
 }
 
 // DeleteAll deletes all items from the database.
@@ -1112,13 +1144,16 @@ func (tx *Tx) DeleteAll() error {
 		return ErrTxIterating
 	}
 
-	// check to see if we've already deleted everything
-	if tx.wc.rbkeys == nil {
-		// we need to backup the live data in case of a rollback.
-		tx.wc.rbkeys = tx.db.keys
-		tx.wc.rbexps = tx.db.exps
-		tx.wc.rbidxs = tx.db.idxs
+	entry := txUndoEntry{
+		kind:        txUndoDeleteAll,
+		keys:        tx.db.keys,
+		exps:        tx.db.exps,
+		indexes:     tx.db.idxs,
+		commitItems: tx.wc.commitItems,
+		deleteAll:   tx.wc.deleteAll,
 	}
+	tx.wc.undo = append(tx.wc.undo, entry)
+	tx.wc.deleteAll = true
 
 	// now reset the live database trees
 	tx.db.keys = btreeNew(lessCtx(nil))
@@ -1126,7 +1161,7 @@ func (tx *Tx) DeleteAll() error {
 	tx.db.idxs = make(map[string]*index)
 
 	// finally re-create the indexes
-	for name, idx := range tx.wc.rbidxs {
+	for name, idx := range entry.indexes {
 		tx.db.idxs[name] = idx.clearCopy()
 	}
 
@@ -1157,8 +1192,7 @@ func (db *DB) Begin(writable bool) (*Tx, error) {
 		// writable transactions have a writeContext object that
 		// contains information about changes to the database.
 		tx.wc = &txWriteContext{}
-		tx.wc.rollbackItems = make(map[string]*dbItem)
-		tx.wc.rollbackIndexes = make(map[string]*index)
+		tx.wc.nextID = 1
 		if db.persist {
 			tx.wc.commitItems = make(map[string]*dbItem)
 		}
@@ -1184,33 +1218,58 @@ func (tx *Tx) unlock() {
 	}
 }
 
+// addUndoItem records the state of a key before it is changed.
+func (tx *Tx) addUndoItem(key string, item *dbItem) {
+	entry := txUndoEntry{kind: txUndoItem, key: key, item: item}
+	if tx.wc.commitItems != nil {
+		entry.commitItem, entry.commitPresent = tx.wc.commitItems[key]
+	}
+	tx.wc.undo = append(tx.wc.undo, entry)
+}
+
+// undoEntry restores the database state captured by a single undo entry.
+func (tx *Tx) undoEntry(entry txUndoEntry) {
+	switch entry.kind {
+	case txUndoItem:
+		tx.db.deleteFromDatabase(&dbItem{key: entry.key})
+		if entry.item != nil {
+			tx.db.insertIntoDatabase(entry.item)
+		}
+		if tx.wc.commitItems != nil {
+			if entry.commitPresent {
+				tx.wc.commitItems[entry.key] = entry.commitItem
+			} else {
+				delete(tx.wc.commitItems, entry.key)
+			}
+		}
+	case txUndoIndex:
+		delete(tx.db.idxs, entry.key)
+		if entry.index != nil {
+			tx.db.idxs[entry.key] = entry.index
+		}
+	case txUndoDeleteAll:
+		tx.db.keys = entry.keys
+		tx.db.exps = entry.exps
+		tx.db.idxs = entry.indexes
+		tx.wc.commitItems = entry.commitItems
+		tx.wc.deleteAll = entry.deleteAll
+	}
+}
+
+// rollbackTo reverts all changes after position in the transaction undo log.
+func (tx *Tx) rollbackTo(position int) {
+	for i := len(tx.wc.undo) - 1; i >= position; i-- {
+		tx.undoEntry(tx.wc.undo[i])
+		tx.wc.undo[i] = txUndoEntry{}
+	}
+	tx.wc.undo = tx.wc.undo[:position]
+}
+
 // rollbackInner handles the underlying rollback logic.
 // Intended to be called from Commit() and Rollback().
 func (tx *Tx) rollbackInner() {
-	// rollback the deleteAll if needed
-	if tx.wc.rbkeys != nil {
-		tx.db.keys = tx.wc.rbkeys
-		tx.db.idxs = tx.wc.rbidxs
-		tx.db.exps = tx.wc.rbexps
-	}
-	for key, item := range tx.wc.rollbackItems {
-		tx.db.deleteFromDatabase(&dbItem{key: key})
-		if item != nil {
-			// When an item is not nil, we will need to reinsert that item
-			// into the database overwriting the current one.
-			tx.db.insertIntoDatabase(item)
-		}
-	}
-	for name, idx := range tx.wc.rollbackIndexes {
-		delete(tx.db.idxs, name)
-		if idx != nil {
-			// When an index is not nil, we will need to rebuilt that index
-			// this could be an expensive process if the database has many
-			// items or the index is complex.
-			tx.db.idxs[name] = idx
-			idx.rebuild()
-		}
-	}
+	tx.rollbackTo(0)
+	tx.wc.savepoints = nil
 }
 
 // Commit writes all changes to disk.
@@ -1226,10 +1285,10 @@ func (tx *Tx) Commit() error {
 		return ErrTxNotWritable
 	}
 	var err error
-	if tx.db.persist && (len(tx.wc.commitItems) > 0 || tx.wc.rbkeys != nil) {
+	if tx.db.persist && (len(tx.wc.commitItems) > 0 || tx.wc.deleteAll) {
 		tx.db.buf = tx.db.buf[:0]
 		// write a flushdb if a deleteAll was called.
-		if tx.wc.rbkeys != nil {
+		if tx.wc.deleteAll {
 			tx.db.buf = append(tx.db.buf, "*1\r\n$7\r\nflushdb\r\n"...)
 		}
 		now := time.Now()
@@ -1298,6 +1357,124 @@ func (tx *Tx) Rollback() error {
 	// Clear the db field to disable this transaction from future use.
 	tx.db = nil
 	return nil
+}
+
+// Savepoint records the current position in the transaction so that later
+// changes can be rolled back without discarding earlier work. Savepoints may
+// be nested. An optional name can be supplied to identify the savepoint later.
+func (tx *Tx) Savepoint(name ...string) (Savepoint, error) {
+	if tx.db == nil {
+		return 0, ErrTxClosed
+	} else if !tx.writable {
+		return 0, ErrTxNotWritable
+	}
+	sp := &savepoint{id: tx.wc.nextID, position: len(tx.wc.undo)}
+	if len(name) > 0 {
+		sp.name = name[0]
+	}
+	tx.wc.nextID++
+	tx.wc.savepoints = append(tx.wc.savepoints, sp)
+	return sp.id, nil
+}
+
+// CreateSavepoint creates a named savepoint.
+func (tx *Tx) CreateSavepoint(name string) error {
+	_, err := tx.Savepoint(name)
+	return err
+}
+
+// SetSavepoint is an alias for CreateSavepoint.
+func (tx *Tx) SetSavepoint(name string) error {
+	return tx.CreateSavepoint(name)
+}
+
+// NewSavepoint creates a savepoint and returns its identifier.
+func (tx *Tx) NewSavepoint(name ...string) (Savepoint, error) {
+	return tx.Savepoint(name...)
+}
+
+// findSavepoint locates a savepoint by identifier or name.
+func (tx *Tx) findSavepoint(value interface{}) (*savepoint, int, error) {
+	switch v := value.(type) {
+	case int:
+		for i, sp := range tx.wc.savepoints {
+			if sp.id == v {
+				return sp, i, nil
+			}
+		}
+	case string:
+		for i := len(tx.wc.savepoints) - 1; i >= 0; i-- {
+			if tx.wc.savepoints[i].name == v {
+				return tx.wc.savepoints[i], i, nil
+			}
+		}
+	}
+	return nil, -1, ErrSavepointNotFound
+}
+
+// RollbackToSavepoint reverts all changes made after the savepoint while
+// keeping earlier changes and the transaction itself open. The savepoint
+// remains valid, while savepoints created after it are discarded. When no
+// savepoint is supplied, the most recently created savepoint is used.
+func (tx *Tx) RollbackToSavepoint(savepoint ...interface{}) error {
+	if tx.db == nil {
+		return ErrTxClosed
+	} else if !tx.writable {
+		return ErrTxNotWritable
+	} else if tx.wc.itercount > 0 {
+		return ErrTxIterating
+	}
+	var target interface{}
+	if len(savepoint) == 0 {
+		if len(tx.wc.savepoints) == 0 {
+			return ErrSavepointNotFound
+		}
+		target = tx.wc.savepoints[len(tx.wc.savepoints)-1].id
+	} else {
+		target = savepoint[0]
+	}
+	sp, index, err := tx.findSavepoint(target)
+	if err != nil {
+		return err
+	}
+	tx.rollbackTo(sp.position)
+	tx.wc.savepoints = tx.wc.savepoints[:index+1]
+	return nil
+}
+
+// RollbackTo is an alias for RollbackToSavepoint.
+func (tx *Tx) RollbackTo(savepoint ...interface{}) error {
+	return tx.RollbackToSavepoint(savepoint...)
+}
+
+// ReleaseSavepoint removes a savepoint and any savepoints created after it.
+// When no savepoint is supplied, the most recently created savepoint is used.
+func (tx *Tx) ReleaseSavepoint(savepoint ...interface{}) error {
+	if tx.db == nil {
+		return ErrTxClosed
+	} else if !tx.writable {
+		return ErrTxNotWritable
+	}
+	var target interface{}
+	if len(savepoint) == 0 {
+		if len(tx.wc.savepoints) == 0 {
+			return ErrSavepointNotFound
+		}
+		target = tx.wc.savepoints[len(tx.wc.savepoints)-1].id
+	} else {
+		target = savepoint[0]
+	}
+	_, index, err := tx.findSavepoint(target)
+	if err != nil {
+		return err
+	}
+	tx.wc.savepoints = tx.wc.savepoints[:index]
+	return nil
+}
+
+// Release is an alias for ReleaseSavepoint.
+func (tx *Tx) Release(savepoint ...interface{}) error {
+	return tx.ReleaseSavepoint(savepoint...)
 }
 
 // dbItemOpts holds various meta information about an item.
@@ -1546,28 +1723,9 @@ func (tx *Tx) Set(key, value string, opts *SetOptions) (previousValue string,
 	// Insert the item into the keys tree.
 	prev := tx.db.insertIntoDatabase(item)
 
-	// insert into the rollback map if there has not been a deleteAll.
-	if tx.wc.rbkeys == nil {
-		if prev == nil {
-			// An item with the same key did not previously exist. Let's
-			// create a rollback entry with a nil value. A nil value indicates
-			// that the entry should be deleted on rollback. When the value is
-			// *not* nil, that means the entry should be reverted.
-			if _, ok := tx.wc.rollbackItems[key]; !ok {
-				tx.wc.rollbackItems[key] = nil
-			}
-		} else {
-			// A previous item already exists in the database. Let's create a
-			// rollback entry with the item as the value. We need to check the
-			// map to see if there isn't already an item that matches the
-			// same key.
-			if _, ok := tx.wc.rollbackItems[key]; !ok {
-				tx.wc.rollbackItems[key] = prev
-			}
-			if !prev.expired() {
-				previousValue, replaced = prev.val, true
-			}
-		}
+	tx.addUndoItem(key, prev)
+	if prev != nil && !prev.expired() {
+		previousValue, replaced = prev.val, true
 	}
 	// For commits we simply assign the item to the map. We use this map to
 	// write the entry to disk.
@@ -1614,12 +1772,7 @@ func (tx *Tx) Delete(key string) (val string, err error) {
 	if item == nil {
 		return "", ErrNotFound
 	}
-	// create a rollback entry if there has not been a deleteAll call.
-	if tx.wc.rbkeys == nil {
-		if _, ok := tx.wc.rollbackItems[key]; !ok {
-			tx.wc.rollbackItems[key] = item
-		}
-	}
+	tx.addUndoItem(key, item)
 	if tx.db.persist {
 		tx.wc.commitItems[key] = nil
 	}
@@ -2185,14 +2338,7 @@ func (tx *Tx) createIndex(name string, pattern string,
 	idx.rebuild()
 	// save the index
 	tx.db.idxs[name] = idx
-	if tx.wc.rbkeys == nil {
-		// store the index in the rollback map.
-		if _, ok := tx.wc.rollbackIndexes[name]; !ok {
-			// we use nil to indicate that the index should be removed upon
-			// rollback.
-			tx.wc.rollbackIndexes[name] = nil
-		}
-	}
+	tx.wc.undo = append(tx.wc.undo, txUndoEntry{kind: txUndoIndex, key: name})
 	return nil
 }
 
@@ -2216,14 +2362,11 @@ func (tx *Tx) DropIndex(name string) error {
 	// delete from the map.
 	// this is all that is needed to delete an index.
 	delete(tx.db.idxs, name)
-	if tx.wc.rbkeys == nil {
-		// store the index in the rollback map.
-		if _, ok := tx.wc.rollbackIndexes[name]; !ok {
-			// we use a non-nil copy of the index without the data to indicate
-			// that the index should be rebuilt upon rollback.
-			tx.wc.rollbackIndexes[name] = idx.clearCopy()
-		}
-	}
+	tx.wc.undo = append(tx.wc.undo, txUndoEntry{
+		kind:  txUndoIndex,
+		key:   name,
+		index: idx,
+	})
 	return nil
 }
 

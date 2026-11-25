@@ -6,6 +6,7 @@ package buntdb
 
 import (
 	"bufio"
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
@@ -195,15 +196,17 @@ func (db *DB) Close() error {
 	return nil
 }
 
-// Save writes a snapshot of the database to a writer. This operation blocks all
-// writes, but not reads. This can be used for snapshots and backups for pure
-// in-memory databases using the ":memory:". Database that persist to disk
-// can be snapshotted by simply copying the database file.
+// Save writes a gzip-compressed snapshot of the database to a writer. This
+// operation blocks all writes, but not reads. This can be used for snapshots
+// and backups for pure in-memory databases using the ":memory:". Databases
+// that persist to disk can be snapshotted by simply copying the database file.
 func (db *DB) Save(wr io.Writer) error {
 	var err error
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	// use a buffered writer and flush every 4MB
+	// Compress directly to the writer so the entire database is never held in
+	// memory. Flush the uncompressed buffer every 4MB.
+	zw := gzip.NewWriter(wr)
 	var buf []byte
 	now := time.Now()
 	// iterated through every item in the database and write to the buffer
@@ -212,7 +215,7 @@ func (db *DB) Save(wr io.Writer) error {
 		buf = dbi.writeSetTo(buf, now)
 		if len(buf) > 1024*1024*4 {
 			// flush when buffer is over 4MB
-			_, err = wr.Write(buf)
+			_, err = zw.Write(buf)
 			if err != nil {
 				return false
 			}
@@ -221,16 +224,18 @@ func (db *DB) Save(wr io.Writer) error {
 		return true
 	})
 	if err != nil {
+		_ = zw.Close()
 		return err
 	}
 	// one final flush
 	if len(buf) > 0 {
-		_, err = wr.Write(buf)
+		_, err = zw.Write(buf)
 		if err != nil {
+			_ = zw.Close()
 			return err
 		}
 	}
-	return nil
+	return zw.Close()
 }
 
 // Load loads commands from reader. This operation blocks all reads and writes.
@@ -242,6 +247,19 @@ func (db *DB) Load(rd io.Reader) error {
 	if db.persist {
 		// cannot load into databases that persist to disk
 		return ErrPersistenceActive
+	}
+	// Detect compressed snapshots without consuming any bytes from the input.
+	br := bufio.NewReader(rd)
+	if header, _ := br.Peek(2); len(header) == 2 &&
+		header[0] == 0x1f && header[1] == 0x8b {
+		zr, err := gzip.NewReader(br)
+		if err != nil {
+			return err
+		}
+		defer zr.Close()
+		rd = zr
+	} else {
+		rd = br
 	}
 	_, err := db.readLoad(rd, time.Now())
 	return err

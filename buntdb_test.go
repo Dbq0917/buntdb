@@ -2,6 +2,7 @@ package buntdb
 
 import (
 	"bytes"
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -120,6 +121,27 @@ func TestSaveLoad(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
+	backup, err := ioutil.ReadFile("temp.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(backup, []byte{0x1f, 0x8b}) {
+		t.Fatal("expected gzip-compressed backup")
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(backup))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := ioutil.ReadAll(zr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := zr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(backup)*3 > len(raw) {
+		t.Fatalf("expected compressed backup to be at least 3x smaller, got %d bytes from %d bytes", len(backup), len(raw))
+	}
 	db.Close()
 	db, _ = Open(":memory:")
 	defer db.Close()
@@ -141,6 +163,37 @@ func TestSaveLoad(t *testing.T) {
 			if ex != val {
 				t.Fatalf("expected %s, got %s", ex, val)
 			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadUncompressed(t *testing.T) {
+	db, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	backup := strings.Join([]string{
+		"*3\r\n$3\r\nset\r\n$5\r\nhello\r\n$5\r\nworld\r\n",
+		"*3\r\n$3\r\nset\r\n$7\r\ndiscard\r\n$5\r\nvalue\r\n",
+		"*2\r\n$3\r\ndel\r\n$7\r\ndiscard\r\n",
+	}, "")
+	if err := db.Load(strings.NewReader(backup)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.View(func(tx *Tx) error {
+		val, err := tx.Get("hello")
+		if err != nil {
+			return err
+		}
+		if val != "world" {
+			t.Fatalf("expected world, got %s", val)
+		}
+		if _, err := tx.Get("discard"); err != ErrNotFound {
+			t.Fatalf("expected discarded key to be missing, got %v", err)
 		}
 		return nil
 	}); err != nil {
